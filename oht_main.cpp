@@ -52,7 +52,7 @@ using namespace wmx3Api;
 using namespace ecApi;
 
 // 축 갯수(확장): 0~8 총 9축
-static const int kNumAxes = 10;
+static const int kNumAxes = 12;
 
 // ===== External launchers declared by user-provided modules =====
 void ShowDemoControlWindow(HWND hParent, bool minimized = false);
@@ -86,7 +86,7 @@ extern bool IsGripperClosed(); // 그립퍼 닫힘 상태 외부 참조
 extern bool IsGripperClosedAndIdle(); // 그립퍼 닫힘 상태 외부 참조
 extern bool g_distable[8]; // 그립퍼 축 비활성화 플래그 외부 참조
 
-// 보조 대기 함수들 (질문 본문과 동일) — WaitUntil, WaitTaskFinished, WaitAllAxesStopped 등
+// 보조 대기 함수들 (질문 본문과 동일) ? WaitUntil, WaitTaskFinished, WaitAllAxesStopped 등
 extern bool WaitUntil(bool (*pred)(), DWORD timeoutMs, DWORD pollMs);
 extern bool WaitAllAxesStopped(double velEps, DWORD timeoutMs); // 외부 참조
 extern bool WaitTaskFinished(TaskId id, DWORD timeoutMs, DWORD pollMs);
@@ -267,7 +267,7 @@ static void SwitchToManual(HWND hMain) {
 	StopMultiJog();
 	StopJogIfActive();
 	// Optionally stop all motion?
-	for (int a = 0; a < kNumAxes; ++a) StopAxis(a); // 선택사항
+	for (int a = 0; a < kNumAxes - 3; ++a) StopAxis(a); // 선택사항
 
 	g_autoMode = false;
 	ApplyModeUI(hMain);
@@ -277,7 +277,7 @@ static void SwitchToAuto(HWND hMain) {
 	StopMultiJog();
 	StopJogIfActive();
 	// Optionally stop all motion?
-	for (int a = 0; a < kNumAxes; ++a) StopAxis(a); // 선택사항
+	for (int a = 0; a < kNumAxes - 3; ++a) StopAxis(a); // 선택사항
 
 	g_autoMode = true;
 	ApplyModeUI(hMain);
@@ -420,6 +420,25 @@ static bool ReadInputBit(int addr, int bit, bool activeHigh) {
 	bool onRaw = (v != 0);
 	return activeHigh ? onRaw : !onRaw;
 }
+
+static bool WriteOutputBit(int addr, int bit, bool onLogical, bool activeHigh)
+{
+	if (!g_commStarted) return false;
+
+	Io io(&g_wmx);
+
+	// 논리 ON/OFF -> 장비에 쓸 raw 값(0/1)으로 변환
+	unsigned char v = 0;
+	if (activeHigh) v = onLogical ? 1 : 0;
+	else            v = onLogical ? 0 : 1;
+
+	// ? 여기 호출은 네 IOApi.h에 있는 "쓰기 함수"로 맞춰야 함
+	long e = io.SetOutBitEx(addr, bit, v);   // (예상 시그니처)
+	if (e != ErrorCode::None) return false;
+
+	return true;
+}
+
 
 static bool Axis2IsIdle()
 {
@@ -572,10 +591,10 @@ static int g_jogActiveAxis = -1;
 static int g_jogActiveSign = 0;
 static bool g_multiJogActive = false;
 static int g_multiJogSign = 0;
-static bool g_multiJogAxisActive[kNumAxes] = {};
+static bool g_multiJogAxisActive[kNumAxes - 3] = {};
 
-static int g_lastCmdVel[kNumAxes] = {};
-static int g_lastCmdTrq[kNumAxes] = {};
+static int g_lastCmdVel[kNumAxes - 3] = {};
+static int g_lastCmdTrq[kNumAxes - 3] = {};
 
 // Demo 상태
 static std::atomic<bool> g_demoRunning{ false };
@@ -660,7 +679,7 @@ struct SelUiUpdateGuard {
 static bool IsSelUiUpdating() { return g_selUiUpdateDepth > 0; }
 
 // ------------------ ECAT 0x6063/0x603F 읽기 함수 ------------------
-const int kAxisSlaveId[kNumAxes] = { 0,1,2,3,4,5,6,7,8,9 };
+const int kAxisSlaveId[kNumAxes] = { 0,1,2,3,4,5,6,7,8,9,10,11 };
 
 static const unsigned short kIdx6063 = 0x6002;
 static const unsigned char kSubIdx6063 = 0x01;
@@ -1117,10 +1136,10 @@ static void StopJogIfActive() {
 static bool StartMultiJog(HWND hWnd, int sign) {
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Info"), MB_ICONWARNING); return false; }
 	//DisableAllEnabledSyncGroups();
-	bool any = false; for (int a = 0; a < kNumAxes; ++a) g_multiJogAxisActive[a] = false;
+	bool any = false; for (int a = 0; a < kNumAxes - 3; ++a) g_multiJogAxisActive[a] = false;
 
 	g_cm.GetStatus(&g_status);
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
 
 		// Auto 모드 인터락: Axis0/2에만 적용
@@ -1183,7 +1202,7 @@ static bool StartMultiJog(HWND hWnd, int sign) {
 }
 static void StopMultiJog() {
 	if (!g_multiJogActive) return;
-	for (int a = 0; a < kNumAxes; ++a) if (g_multiJogAxisActive[a]) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (g_multiJogAxisActive[a]) {
 		g_cm.motion->Stop(a); g_cm.velocity->Stop(a); if (g_cm.torque) g_cm.torque->StopTrq(a); g_multiJogAxisActive[a] = false;
 	}
 	g_multiJogActive = false; g_multiJogSign = 0;
@@ -1354,15 +1373,15 @@ static bool StartComm() {
 	g_estopActive = false;
 
 	// 기어비 설정 등 초기 파라미터
-	SetAxisGearRatio(0, 43000.0, 10000.0);
-	SetAxisGearRatio(1, 43000.0, 10000.0);
-	SetAxisGearRatio(2, 100000.0, 10000.0);
-	SetAxisGearRatio(3, 10000.0, 10000.0);
-	SetAxisGearRatio(4, 10000.0, 10000.0);
-	SetAxisGearRatio(5, 10000.0, 10000.0);
-	SetAxisGearRatio(6, 10000.0, 10000.0);
-	SetAxisGearRatio(7, 10000.0, 10000.0);
-	SetAxisGearRatio(8, 10000.0, 10000.0);
+	SetAxisGearRatio(0, 43000.0, 10000.0); // 폭조절
+	SetAxisGearRatio(1, 43000.0, 10000.0); //포킹암
+	SetAxisGearRatio(2, 30000.0, 10000.0); // 사이드바퀴 업다운
+	SetAxisGearRatio(3, 30000.0, 10000.0); //사이드바퀴 업다운
+	SetAxisGearRatio(4, 100000.0, 10000.0); //벨트업다운
+	SetAxisGearRatio(5, 100000.0, 10000.0); //사이드바퀴 주행
+	SetAxisGearRatio(6, 100000.0, 10000.0); //사이드바퀴 주행
+	SetAxisGearRatio(7, 44247.8, 10000.0); //좌우주행
+	SetAxisGearRatio(8, 44247.8, 10000.0); //좌우주행
 
 	// Axis2 sensor flags reset
 	g_ax2LimitOn = false;
@@ -1374,6 +1393,8 @@ static bool StartComm() {
 	g_ax2HomeDebounceOn = false;
 	g_ax2HomeLastTick = GetTickCount();
 	g_ax2HomeRampIssued = false;
+
+	WriteOutputBit(36, 0, true, true);
 
 	return true;
 }
@@ -1664,7 +1685,7 @@ static void LogFrameHuman(const unsigned char* f, int len, const wchar_t* prefix
 
 static void DoOhtAction_EStopAll() {
 	// 예시: 전체 급정지
-	for (int a = 0; a < kNumAxes; ++a) StopAxis(a);
+	for (int a = 0; a < kNumAxes - 3; ++a) StopAxis(a);
 }
 
 
@@ -1969,7 +1990,7 @@ void TcpServerThreadProc()
 				// ---------------- RESET ----------------
 			case 0xFD: // 리셋
 				AppendLog(L"[INFO] PLC -> PC : Reset Request");
-				for (int a = 0; a < kNumAxes; ++a) {
+				for (int a = 0; a < kNumAxes - 3; ++a) {
 					g_cm.axisControl->ClearAmpAlarm(a);
 				}
 				SendSimpleAck(g_clientSock, 0xFD);
@@ -2455,16 +2476,16 @@ static void SetAxisChecked(HWND hWnd, int axis, bool checked) {
 	if (hb) SendMessage(hb, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 static void UpdateSelectedAxesTextOnDemand(HWND hWnd) {
-	bool sel[kNumAxes] = {};
-	for (int a = 0; a < kNumAxes; ++a) sel[a] = IsAxisChecked(hWnd, a);
+	bool sel[kNumAxes - 3] = {};
+	for (int a = 0; a < kNumAxes - 3; ++a) sel[a] = IsAxisChecked(hWnd, a);
 	TCHAR text[256] = TEXT("Selected: "); bool any = false;
-	for (int a = 0; a < kNumAxes; ++a) if (sel[a]) { TCHAR t[16]; _stprintf_s(t, TEXT("%s%d"), any ? TEXT(", ") : TEXT(""), a); _tcscat_s(text, t); any = true; }
+	for (int a = 0; a < kNumAxes - 3; ++a) if (sel[a]) { TCHAR t[16]; _stprintf_s(t, TEXT("%s%d"), any ? TEXT(", ") : TEXT(""), a); _tcscat_s(text, t); any = true; }
 	if (!any) _tcscat_s(text, TEXT("(none)"));
 	SetWindowText(GetDlgItem(hWnd, ID_TXT_SELECTED_AXES), text);
 }
 
 static void Multi_SetAllAxisChecked(HWND hWnd, bool checked) {
-	for (int a = 0; a < kNumAxes; ++a) SetAxisChecked(hWnd, a, checked);
+	for (int a = 0; a < kNumAxes - 3; ++a) SetAxisChecked(hWnd, a, checked);
 	UpdateSelectedAxesTextOnDemand(hWnd);
 }
 
@@ -2474,7 +2495,7 @@ static bool IsAxisSlaveInEnabledSyncGroup(int axis, int* outGroupId = nullptr, i
 	if (!g_commStarted) return false;
 	if (!g_cm.sync) return false;
 
-	for (int gid = 0; gid < kNumAxes; ++gid) {
+	for (int gid = 0; gid < kNumAxes - 3; ++gid) {
 		Sync::SyncGroupStatus st{};
 		long se = g_cm.sync->GetSyncGroupStatus(gid, &st);
 		if (se != ErrorCode::None || !st.enabled) continue;
@@ -2568,7 +2589,7 @@ static void DoRelMoveAxis(HWND hWnd, int axis, int dir) {
 static void DoMultiAbs(HWND hWnd) {
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Info"), MB_ICONWARNING); return; }
 	//DisableAllEnabledSyncGroups();
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a) && EnsureServoOn(a) && EnsurePosModeNoStop(a)) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a) && EnsureServoOn(a) && EnsurePosModeNoStop(a)) {
 
 		//// Axis2 보호
 		//if (a == 2) {
@@ -2604,7 +2625,7 @@ static void DoMultiAbs(HWND hWnd) {
 static void DoMultiRel(HWND hWnd) {
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Info"), MB_ICONWARNING); return; }
 	//DisableAllEnabledSyncGroups();
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a) && EnsureServoOn(a) && EnsurePosModeNoStop(a)) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a) && EnsureServoOn(a) && EnsurePosModeNoStop(a)) {
 
 		//// Axis2 보호
 		//if (a == 2) {
@@ -2643,7 +2664,7 @@ static void DoMultiRel(HWND hWnd) {
 }
 static void DoMultiAlarmReset(HWND hWnd) {
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Alarm Reset(Selected)"), MB_ICONWARNING); return; }
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
 		g_cm.motion->Stop(a); g_cm.velocity->Stop(a); if (g_cm.torque) g_cm.torque->StopTrq(a); Sleep(10);
 		g_cm.GetStatus(&g_status);
@@ -2710,8 +2731,8 @@ static void Sync_DetectAxes() {
 	g_syncUi.detectedAxes.clear();
 	if (!g_commStarted) return;
 	g_cm.GetStatus(&g_status);
-	for (int ax = 0; ax < kNumAxes; ++ax) {
-		if (ax < kNumAxes) g_syncUi.detectedAxes.push_back(ax);
+	for (int ax = 0; ax < kNumAxes - 3; ++ax) {
+		if (ax < kNumAxes - 3) g_syncUi.detectedAxes.push_back(ax);
 	}
 }
 
@@ -3155,7 +3176,7 @@ static void Sync_CreateUI(HWND h) {
 	CreateWindow(TEXT("BUTTON"), TEXT("동기 그룹 설정"), WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 10, 480, 440, h, 0, 0, 0);
 	CreateWindow(TEXT("STATIC"), TEXT("동기 그룹"), WS_CHILD | WS_VISIBLE, 20, 40, 70, 22, h, 0, 0, 0);
 	HWND hCmb = CreateWindow(TEXT("COMBOBOX"), TEXT(""), WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 100, 36, 120, 200, h, (HMENU)ID_SYNC_GROUP_COMBO, 0, 0);
-	for (int gid = 0; gid < kNumAxes; ++gid) {
+	for (int gid = 0; gid < kNumAxes - 3; ++gid) {
 		TCHAR t[16]; _stprintf_s(t, TEXT("Group %d"), gid);
 		SendMessage(hCmb, CB_ADDSTRING, 0, (LPARAM)(LPCTSTR)t);
 	}
@@ -3459,9 +3480,9 @@ static LRESULT CALLBACK SyncWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 }
 
 static bool ExclusiveStopExcept(const std::vector<int>& allowed, DWORD timeout_ms = 5000) {
-	for (int a = 0; a < kNumAxes; ++a) if (!std::count(allowed.begin(), allowed.end(), a)) StopAxis(a);
-	std::vector<int> waitAxes; waitAxes.reserve(kNumAxes);
-	for (int a = 0; a < kNumAxes; ++a) if (!std::count(allowed.begin(), allowed.end(), a)) waitAxes.push_back(a);
+	for (int a = 0; a < kNumAxes - 3; ++a) if (!std::count(allowed.begin(), allowed.end(), a)) StopAxis(a);
+	std::vector<int> waitAxes; waitAxes.reserve(kNumAxes - 3);
+	for (int a = 0; a < kNumAxes - 3; ++a) if (!std::count(allowed.begin(), allowed.end(), a)) waitAxes.push_back(a);
 	if (!waitAxes.empty()) return WaitAxesIdle(waitAxes, timeout_ms);
 	return true;
 }
@@ -3469,7 +3490,7 @@ static bool ExclusiveStopExcept(const std::vector<int>& allowed, DWORD timeout_m
 static void DisableAllEnabledSyncGroups() {
 	if (!g_commStarted) return;
 
-	for (int gid = 0; gid < kNumAxes; ++gid) {
+	for (int gid = 0; gid < kNumAxes - 3; ++gid) {
 		Sync::SyncGroupStatus s{};
 		if (g_cm.sync->GetSyncGroupStatus(gid, &s) == ErrorCode::None && s.enabled) {
 			g_cm.sync->EnableSyncGroup(gid, 0);
@@ -3492,7 +3513,7 @@ static void DisableAllEnabledSyncGroups() {
 
 // ------------------ 상태 갱신 ------------------
 static void UpdateStatus(HWND hWnd) {
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		const auto& ax = g_status.axesStatus[a];
 		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 0))) SetWindowText(h, ax.servoOn ? (TCHAR*)TEXT("ON") : (TCHAR*)TEXT("OFF"));
 
@@ -3647,6 +3668,11 @@ static LRESULT CALLBACK SerialWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 
 
 
+// =====================================================
+// Hybrid Barcode Demo (Stop-distance based auto decel)
+// Copy-paste whole block
+// =====================================================
+
 HWND g_hBarcodeWnd = nullptr;
 
 enum : int {
@@ -3669,8 +3695,10 @@ enum : int {
 	ID_BC_EDIT_MOT_CPR = 30042,
 	ID_BC_EDIT_BC_MM_PER_CNT = 30043,
 	ID_BC_TXT_COMPUTED_PULSES = 30050,
-	ID_BC_EDIT_CORR_DEADBAND = 30106,
-	ID_BC_EDIT_CORR_START_BCERR = 30107,
+
+	// NOTE: 기존 ID 이름 유지 (표시는 Static로 사용 가능)
+	ID_BC_EDIT_CORR_DEADBAND = 30106,     // (표시용: Arrive band)
+	ID_BC_EDIT_CORR_START_BCERR = 30107,  // (표시용: Auto Corr EntryDist)
 
 	ID_BC_BTN_SERVO_ON = 30020,
 	ID_BC_BTN_SERVO_OFF = 30021,
@@ -3680,93 +3708,123 @@ enum : int {
 };
 
 // ======================================================
-void Barcode_SetTxt(HWND h, int id, const wchar_t* s)
+// UI helpers
+static void Barcode_SetTxt(HWND h, int id, const wchar_t* s)
 {
-	if (HWND hh = GetDlgItem(h, id))
-		SetWindowTextW(hh, s);
+	if (HWND hh = GetDlgItem(h, id)) SetWindowTextW(hh, s);
 }
-void Barcode_SetInt(HWND h, int id, int v)
+static void Barcode_SetInt(HWND h, int id, int v)
 {
 	wchar_t b[64]; _snwprintf_s(b, _TRUNCATE, L"%d", v);
 	Barcode_SetTxt(h, id, b);
 }
-void Barcode_SetLL(HWND h, int id, long long v)
+static void Barcode_SetLL(HWND h, int id, long long v)
 {
 	wchar_t b[64]; _snwprintf_s(b, _TRUNCATE, L"%lld", v);
 	Barcode_SetTxt(h, id, b);
 }
-void Barcode_SetD(HWND h, int id, double v)
-{
-	wchar_t b[64]; _snwprintf_s(b, _TRUNCATE, L"%.3f", v);
-	Barcode_SetTxt(h, id, b);
-}
 
 // =====================================================
+// State
 struct HybridBarcodeState
 {
 	std::atomic<bool> running{ false };
-	std::atomic<bool> inCorr{ false };
-	std::atomic<bool> finalSnapSent{ false }; // one-shot final command flag
 
-	int axis = 0;
-	long long targetBarcodeAbs = 0;   // absolute barcode(6063) target
-	long long targetBarcodeRel = 0;   // relative barcode to current 6063
-	long long targetMotorPulse = 0;   // pulses for targetBarcodeRel (precomputed at Start)
+	int axis = 7;
 
-	// Main profile (for initial long move)
-	double mainVel = 10000;           // pps
-	double mainAcc = 1000;            // ms
-	double mainDec = 1000;            // ms
+	long long targetBarcodeAbs = 0;     // final target barcode abs (6063)
+	long long targetBarcodeRel = 0;     // final target - now (cnt)
+	long long remainingMotorPulse = 0;  // remaining pulses (final target 기준)
 
-	// Correction profile (for S-curve corrections and snap)
-	double corrVel = 1000;           // pps (default same as mainVel)
-	double corrAcc = 1000;             // ms
-	double corrDec = 1000;             // ms
+	// ====== 2-Stage control ======
+	// COARSE: 목표 10cnt 전(coarseTarget)으로 접근
+	// COARSE_BRAKE: StopAxis 없이 "프로파일 감속으로" 속도 0 도달 대기
+	// FINE: 1cnt(step)씩 ±2cnt 안으로 들어갈 때까지 접근
+	enum Phase { IDLE = 0, COARSE = 1, COARSE_BRAKE = 2, FINE = 3, DONE = 4 };
+	Phase phase = IDLE;
 
-	int deadband = 2;                 // barcode cnt deadband
-	int startBcErr = 500;             // overridden from mainVel * 0.1 at start
+	int preStopCnt = 10;                  // ✅ 목표보다 10cnt 전에 정지(속도0)
+	long long coarseTargetBarcodeAbs = 0; // 목표-10cnt의 임시 목표(6063 abs)
 
-	// Conversion
-	double gear = 4.3;
-	double wheelDia = 70;             // mm
-	double motorCpr = 10000;          // pulses per rev
-	double bcMmPerCnt = 0.1;          // mm per barcode count
+	int coarseArriveCnt = 1;              // coarse 목표에 ±1cnt
+	int coarseStableTicksNeed = 5;        // 30ms*5=150ms 안정화
+	int coarseStableTicks = 0;
 
-	bool   stopDelayActive = false;
-	int    stopDelayTimer = 0;
+	// ✅ "프로파일 정지" 파라미터(StopAxis 대신 사용)
+	double coarseBrakeVelPps = 800.0;     // 정지 명령 시 vel 상한(너무 작을 필요 없음)
+	double coarseBrakeAccMs = 50.0;
+	double coarseBrakeDecMs = 500.0;      // 작을수록 더 급감속(충격↑), 크면 부드러움↑
+	double coarseStopVelThreshPps = 80.0; // 이 이하이면 '거의 0속도'로 판정
+
+	ULONGLONG fineStartCooldownUntil = 0; // coarse stop 이후 잠깐 대기 후 fine 시작
+
+	// Main profile (UI)
+	double mainVel = 10000; // pps
+	double mainAcc = 1000;  // ms
+	double mainDec = 1000;  // ms
+
+	// Correction profile (UI)
+	double corrVel = 1000;  // pps
+	double corrAcc = 300;   // ms
+	double corrDec = 300;   // ms
+
+	// Arrival (barcode) - final
+	int arriveCnt = 2;                 // final: ±2 cnt
+	int arriveStableTicksNeed = 10;    // 30ms*10=300ms
+	int arriveStableTicks = 0;
+
+	// Conversion (UI)
+	double gear = 4.4248;
+	double wheelDia = 115;     // mm
+	double motorCpr = 10000;   // pulses per motor rev
+	double bcMmPerCnt = 1.07;  // mm per barcode count
+
+	// Overshoot detect
+	int lastErrSign = 0;
+	int signFlipTicks = 0;
+	bool forbidReverse = true;
+
+	// command throttling
+	double lastCmdVel = 0.0;
+	long long lastCmdTarget = 0;
+	ULONGLONG lastCmdTick = 0;
+
+	// close-in creep (fine)
+	int creepCnt = 50;          // 50cnt 이내면 더 느리게
+	double creepVel = 200.0;    // pps
+
+	// fine step limit (overshoot 방지용)
+	int fineStepCntMax = 1;     // fine에서 한 번에 최대 Ncnt만 이동 (1 추천)
+
+	// 표시용: 자동 corr 진입 거리(펄스)
+	long long autoCorrEntryDistPulse = 0;
+
+	// --- measured decel estimator (pps^2) ---
+	double vPrevPps = 0.0;
+	double aDecEma = 0.0;
+	bool   havePrevV = false;
+
+	// Stop cooldown (startpos/명령충돌 방지)
+	ULONGLONG stopCooldownUntil = 0;
 };
-HybridBarcodeState g_hbc;
+static HybridBarcodeState g_hbc;
 
-// External functions/objects assumed to exist in project:
-// - bool g_commStarted;
-// - struct { AxisStatus axesStatus[4]; } g_status; with .actualPos (pulses), .actualVelocity (rpm)
-// - Controller g_cm; with GetStatus(...), motion->Stop(int), axisControl->SetServoOn(...)
-// - bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
-// - int kAxisSlaveId[4];
-// - void StartAbsMoveWithProfile(int axis, long long targetAbsPulse, double vel_pps, double acc_ms, double dec_ms);
-// - void EnsureServoOn(int axis);
-// - void EnsurePosModeNoStop(int axis);
-// - void StopAxis(int axis);
-// - double GetDlgDouble(HWND, int id, double def);
-
-// =====================================================
-static bool Bc_ReadSelectedAxis_6063(int& outVal)
-{
-	int axis = g_hbc.axis;
-	if (axis < 0 || axis >= kNumAxes) return false;
-	return ReadAxis_TxPDO_6063(kAxisSlaveId[axis], outVal);
-}
+static inline int HBC_signll(long long v) { return (v > 0) - (v < 0); }
 
 struct HbcSnapshot {
 	double gear, wheelDia, motorCpr, bcMmPerCnt;
 };
+
+// ✅ gear 반영 (필수)
 static inline double HBC_pulsesPerMm(const HbcSnapshot& s)
 {
-	return s.motorCpr / (3.14159265358979 * s.wheelDia);
+	// pulses per wheel rev = motorCpr * gear
+	// wheel circumference = pi * wheelDia
+	return s.motorCpr / (3.14159265358979323846 * s.wheelDia);
 }
 static inline double HBC_bcToMm(const HbcSnapshot& s, long long bc)
 {
-	return bc * s.bcMmPerCnt;
+	return (double)bc * s.bcMmPerCnt;
 }
 static inline long long HBC_mmToPulses(const HbcSnapshot& s, double mm)
 {
@@ -3778,10 +3836,93 @@ static inline long long HBC_bcToPulses(const HbcSnapshot& s, long long bc)
 	return HBC_mmToPulses(s, HBC_bcToMm(s, bc));
 }
 
-// Auto compute start error from mainVel: startErr = round(mainVel * 0.1)
-static inline int HBC_ComputeAutoStartErr(double mainVel_pps)
+// motor rpm -> pps
+static inline double HBC_RpmToPps(double motorRpm, double motorCpr)
 {
-	return (int)std::llround(mainVel_pps * 0.01);
+	return std::fabs(motorRpm) * motorCpr / 60.0;
+}
+
+// profile decel model (pps^2), acc/dec(ms) = time-to-reach-vel
+static inline double HBC_DecelPps2_Model(double profileVelPps, double decMs, double safetyFactor /* <1 => conservative */)
+{
+	double t = std::max(1.0, decMs) / 1000.0; // sec
+	double a = profileVelPps / t;             // pps^2
+	safetyFactor = std::clamp(safetyFactor, 0.05, 1.0);
+	a *= safetyFactor;
+	return std::max(1.0, a);
+}
+static inline double HBC_StopDistPulses(double vPps, double aDecPps2)
+{
+	return (vPps * vPps) / (2.0 * std::max(1.0, aDecPps2));
+}
+static inline double HBC_VelLimitFromDist(double distPulses, double aDecPps2)
+{
+	if (distPulses <= 0) return 0.0;
+	return std::sqrt(2.0 * std::max(1.0, aDecPps2) * distPulses);
+}
+
+// =====================================================
+// ✅ Selected axis barcode read (axis=9 고정 제거)
+static bool Bc_ReadSelectedAxis_6063(int& outVal)
+{
+	int axis = 9;
+	if (axis < 0 || axis >= kNumAxes) return false;
+	return ReadAxis_TxPDO_6063(kAxisSlaveId[axis], outVal);
+}
+
+// =====================================================
+// ✅ StopAxis 대신 "현재 위치로 AbsMove"를 보내서 프로파일 감속으로 0속도 만들기
+static void HBC_ProfileStop(int ax, double vel_pps, double acc_ms, double dec_ms)
+{
+	// 현재 위치를 목표로 AbsMove를 보내면, 드라이브는 감속해서 정지(0속도)하게 됨
+	g_cm.GetStatus(&g_status);
+	long long curPos = g_status.axesStatus[ax].actualPos;
+
+	vel_pps = std::max(50.0, vel_pps);
+	acc_ms = std::max(1.0, acc_ms);
+	dec_ms = std::max(1.0, dec_ms);
+
+	StartAbsMoveWithProfile(ax, curPos, vel_pps, acc_ms, dec_ms);
+
+	g_hbc.lastCmdVel = vel_pps;
+	g_hbc.lastCmdTarget = curPos;
+	g_hbc.lastCmdTick = GetTickCount64();
+}
+
+// =====================================================
+// ✅ Throttle: 속도변경뿐 아니라 "target 변경"도 반영
+static void HBC_SendMoveThrottled(
+	int ax,
+	long long absTarget,
+	double vel_pps,
+	double acc_ms,
+	double dec_ms,
+	double velChangeRatio,
+	long long minTargetDeltaPulses,
+	DWORD  minPeriodMs
+)
+{
+	if (!g_hbc.running) return;
+
+	ULONGLONG now = GetTickCount64();
+	if (now < g_hbc.stopCooldownUntil) return;        // Stop 직후 명령 금지
+	if (now < g_hbc.fineStartCooldownUntil) return;   // coarse→fine 전환 직후 대기
+
+	bool periodOk = (now - g_hbc.lastCmdTick) >= (ULONGLONG)minPeriodMs;
+
+	double lastV = g_hbc.lastCmdVel;
+	bool velChanged = (lastV <= 1.0) ? true : ((std::fabs(vel_pps - lastV) / lastV) >= velChangeRatio);
+
+	long long lastT = g_hbc.lastCmdTarget;
+	bool targetChanged = (std::llabs(absTarget - lastT) >= std::max(1LL, minTargetDeltaPulses));
+
+	if (periodOk && (velChanged || targetChanged))
+	{
+		StartAbsMoveWithProfile(ax, absTarget, vel_pps, acc_ms, dec_ms);
+		g_hbc.lastCmdVel = vel_pps;
+		g_hbc.lastCmdTarget = absTarget;
+		g_hbc.lastCmdTick = now;
+	}
 }
 
 // =====================================================
@@ -3791,37 +3932,47 @@ void HBC_Start(HWND hWnd)
 		MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Barcode"), MB_ICONWARNING);
 		return;
 	}
+
 	g_hbc.running = false;
-	g_hbc.inCorr = false;
-	g_hbc.finalSnapSent = false;
 
-	// 항상 재시작할 때 초기화
-	g_hbc.stopDelayActive = false;
-	g_hbc.stopDelayTimer = 0;
+	// resets
+	g_hbc.phase = HybridBarcodeState::IDLE;
+	g_hbc.arriveStableTicks = 0;
+	g_hbc.coarseStableTicks = 0;
+	g_hbc.lastErrSign = 0;
+	g_hbc.signFlipTicks = 0;
+	g_hbc.stopCooldownUntil = 0;
+	g_hbc.fineStartCooldownUntil = 0;
 
-	int ax = g_hbc.axis;
+	// Measured decel reset
+	g_hbc.havePrevV = false;
+	g_hbc.vPrevPps = 0.0;
+	g_hbc.aDecEma = 0.0;
 
 	// Read UI parameters - Main profile
 	g_hbc.mainVel = GetDlgDouble(hWnd, ID_BC_EDIT_VEL, 10000);
 	g_hbc.mainAcc = GetDlgDouble(hWnd, ID_BC_EDIT_ACC, 1000);
 	g_hbc.mainDec = GetDlgDouble(hWnd, ID_BC_EDIT_DEC, 1000);
 
-	// Correction profile (defaults: vel same as main, acc/dec 300 ms)
+	// Correction profile
 	g_hbc.corrVel = GetDlgDouble(hWnd, ID_BC_EDIT_CORR_VEL, 1000);
-	g_hbc.corrAcc = GetDlgDouble(hWnd, ID_BC_EDIT_CORR_ACC, 1000);
-	g_hbc.corrDec = GetDlgDouble(hWnd, ID_BC_EDIT_CORR_DEC, 1000);
-
-	g_hbc.deadband = (int)GetDlgDouble(hWnd, ID_BC_EDIT_CORR_DEADBAND, 2);
-
-	// Auto compute startBcErr based on mainVel (0.1x)
-	g_hbc.startBcErr = HBC_ComputeAutoStartErr(g_hbc.mainVel);
-	Barcode_SetInt(hWnd, ID_BC_EDIT_CORR_START_BCERR, g_hbc.startBcErr);
+	g_hbc.corrAcc = GetDlgDouble(hWnd, ID_BC_EDIT_CORR_ACC, 300);
+	g_hbc.corrDec = GetDlgDouble(hWnd, ID_BC_EDIT_CORR_DEC, 300);
 
 	// Conversion
-	g_hbc.gear = GetDlgDouble(hWnd, ID_BC_EDIT_GEAR, 4.3);
-	g_hbc.wheelDia = GetDlgDouble(hWnd, ID_BC_EDIT_WHEEL_D, 70);
+	g_hbc.gear = GetDlgDouble(hWnd, ID_BC_EDIT_GEAR, 4.4248);
+	g_hbc.wheelDia = GetDlgDouble(hWnd, ID_BC_EDIT_WHEEL_D, 115);
 	g_hbc.motorCpr = GetDlgDouble(hWnd, ID_BC_EDIT_MOT_CPR, 10000);
-	g_hbc.bcMmPerCnt = GetDlgDouble(hWnd, ID_BC_EDIT_BC_MM_PER_CNT, 0.1);
+	g_hbc.bcMmPerCnt = GetDlgDouble(hWnd, ID_BC_EDIT_BC_MM_PER_CNT, 1.07);
+
+	// Arrive 설정 (final)
+	g_hbc.arriveCnt = 2;
+	g_hbc.arriveStableTicksNeed = 10;
+
+	// Pre-stop 설정 (10cnt)
+	g_hbc.preStopCnt = 10;
+	g_hbc.coarseArriveCnt = 1;
+	g_hbc.coarseStableTicksNeed = 5;
 
 	int now6063 = 0;
 	if (!Bc_ReadSelectedAxis_6063(now6063)) {
@@ -3829,22 +3980,42 @@ void HBC_Start(HWND hWnd)
 		return;
 	}
 
+	// Final target barcode abs
 	g_hbc.targetBarcodeAbs = (long long)GetDlgDouble(hWnd, ID_BC_EDIT_TARGET, 0);
-	g_hbc.targetBarcodeRel = g_hbc.targetBarcodeAbs - now6063;
+
+	// 방향(부호) 결정
+	long long finalErr = g_hbc.targetBarcodeAbs - (long long)now6063;
+	int dir = HBC_signll(finalErr);
+	if (dir == 0) {
+		g_hbc.phase = HybridBarcodeState::FINE;
+		g_hbc.running = true;
+		g_hbc.lastErrSign = 0;
+		return;
+	}
+
+	// COARSE 임시 목표: 목표보다 10cnt 앞(방향 기준)
+	g_hbc.coarseTargetBarcodeAbs = g_hbc.targetBarcodeAbs - (long long)dir * (long long)g_hbc.preStopCnt;
+
+	// initial sign
+	g_hbc.lastErrSign = dir;
+
+	// 초기 move는 COARSE 목표로 한 번 보내고, 이후 Poll에서 피드백 보정
+	g_cm.GetStatus(&g_status);
+	int ax = g_hbc.axis;
+	long long curPos = g_status.axesStatus[ax].actualPos;
 
 	HbcSnapshot s{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
-	g_hbc.targetMotorPulse = HBC_bcToPulses(s, g_hbc.targetBarcodeRel);
+	long long coarseRel = (long long)g_hbc.coarseTargetBarcodeAbs - (long long)now6063;
+	long long coarsePulses = HBC_bcToPulses(s, coarseRel);
+	long long absTarget = curPos + coarsePulses;
 
-	g_cm.GetStatus(&g_status);
-	long long curPos = g_status.axesStatus[ax].actualPos;
-	long long tgt = curPos + g_hbc.targetMotorPulse;
+	StartAbsMoveWithProfile(ax, absTarget, g_hbc.mainVel, g_hbc.mainAcc, g_hbc.mainDec);
+	g_hbc.lastCmdVel = g_hbc.mainVel;
+	g_hbc.lastCmdTarget = absTarget;
+	g_hbc.lastCmdTick = GetTickCount64();
 
-	// First main move toward target motor position with main profile
-	StartAbsMoveWithProfile(ax, tgt, g_hbc.mainVel, g_hbc.mainAcc, g_hbc.mainDec);
-
+	g_hbc.phase = HybridBarcodeState::COARSE;
 	g_hbc.running = true;
-	g_hbc.inCorr = false;
-	g_hbc.finalSnapSent = false;
 }
 
 // =====================================================
@@ -3858,140 +4029,283 @@ void HBC_UpdateUi(HWND hWnd)
 
 	long long userTarget = (long long)GetDlgDouble(hWnd, ID_BC_EDIT_TARGET, 0.0);
 	g_hbc.targetBarcodeAbs = userTarget;
-	long long diff = userTarget - now6063;
-	g_hbc.targetBarcodeRel = diff;
+
+	long long bcErr = userTarget - (long long)now6063;
+	g_hbc.targetBarcodeRel = bcErr;
 
 	HbcSnapshot s{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
-	long long pulses = HBC_bcToPulses(s, diff);
-	g_hbc.targetMotorPulse = pulses;
+	long long pulses = HBC_bcToPulses(s, bcErr);
+	g_hbc.remainingMotorPulse = pulses;
 
 	Barcode_SetLL(hWnd, ID_BC_TXT_COMPUTED_PULSES, pulses);
 
-	wchar_t st[256];
-	swprintf_s(st, L"Running=%s  CorrMode=%s  FinalSnap=%s  Rel=%lld  Pulses=%lld  S=%d  DB=%d  Corr[V/A/D]=%.0f/%.0f/%.0f",
-		g_hbc.running ? L"Yes" : L"No",
-		g_hbc.inCorr ? L"Yes" : L"No",
-		g_hbc.finalSnapSent ? L"Yes" : L"No",
-		diff, pulses, g_hbc.startBcErr, g_hbc.deadband,
-		g_hbc.corrVel, g_hbc.corrAcc, g_hbc.corrDec);
+	// 표시: Auto corr entry dist
+	Barcode_SetLL(hWnd, ID_BC_EDIT_CORR_START_BCERR, g_hbc.autoCorrEntryDistPulse);
+
+	const wchar_t* phaseStr =
+		(g_hbc.phase == HybridBarcodeState::IDLE) ? L"IDLE" :
+		(g_hbc.phase == HybridBarcodeState::COARSE) ? L"COARSE(to -10cnt)" :
+		(g_hbc.phase == HybridBarcodeState::COARSE_BRAKE) ? L"COARSE_BRAKE(profile stop)" :
+		(g_hbc.phase == HybridBarcodeState::FINE) ? L"FINE(step to ±2cnt)" :
+		L"DONE";
+
+	wchar_t st[980];
+	swprintf_s(st,
+		L"Run=%s Phase=%s Axis=%d Now6063=%d Target=%lld Err(cnt)=%lld RemPulses=%lld  "
+		L"CoarseTarget=%lld(preStop=%dcnt)  AutoCorrEntry(pulse)=%lld  "
+		L"Arrive=±%dcnt(%d/%d) CoarseArr=±%dcnt(%d/%d) "
+		L"Main[V/A/D]=%.0f/%.0f/%.0f  Corr[V/A/D]=%.0f/%.0f/%.0f  aDecEma=%.0fpps2",
+		g_hbc.running ? L"Y" : L"N",
+		phaseStr,
+		g_hbc.axis,
+		now6063,
+		userTarget,
+		bcErr,
+		pulses,
+		g_hbc.coarseTargetBarcodeAbs,
+		g_hbc.preStopCnt,
+		g_hbc.autoCorrEntryDistPulse,
+		g_hbc.arriveCnt, g_hbc.arriveStableTicks, g_hbc.arriveStableTicksNeed,
+		g_hbc.coarseArriveCnt, g_hbc.coarseStableTicks, g_hbc.coarseStableTicksNeed,
+		g_hbc.mainVel, g_hbc.mainAcc, g_hbc.mainDec,
+		g_hbc.corrVel, g_hbc.corrAcc, g_hbc.corrDec,
+		g_hbc.aDecEma
+	);
 	Barcode_SetTxt(hWnd, ID_BC_TXT_STATUS, st);
 }
 
+// =====================================================
+// Stop-distance based auto decel (with measured decel assist)
+// + 2-stage: COARSE to (target-10cnt) -> ProfileStop to 0 speed -> FINE step to ±2cnt
 void HBC_Poll(HWND hWnd)
 {
 	if (!g_hbc.running) return;
 
-	const long long snapErr = 100;      // snapErr threshold
-	const long long finalCheckErr = 2;  // final check threshold
+	const double dtSec = 0.03; // 30ms
+	const int overshootConfirmTicks = 3;
 
 	int ax = g_hbc.axis;
 
 	int now6063 = 0;
 	if (!Bc_ReadSelectedAxis_6063(now6063)) return;
 
-	long long bcErr = g_hbc.targetBarcodeAbs - now6063;
-	long long eAbs = llabs(bcErr);
+	// phase에 따라 활성 목표(6063 abs)
+	long long activeTargetAbs =
+		(g_hbc.phase == HybridBarcodeState::COARSE || g_hbc.phase == HybridBarcodeState::COARSE_BRAKE)
+		? g_hbc.coarseTargetBarcodeAbs
+		: g_hbc.targetBarcodeAbs;
 
-	// deadband 안에 있는지 여부
-	bool inDeadband = (eAbs <= g_hbc.deadband);
+	long long bcErr = activeTargetAbs - (long long)now6063;
+	long long bcErrAbs = llabs(bcErr);
 
-	if (inDeadband)
-	{
-		// deadband 최초 진입 시 타이머 세팅
-		if (!g_hbc.stopDelayActive)
-		{
-			g_hbc.stopDelayActive = true;
+	// ===== 공통: 실제 속도 읽기(감속 EMA) =====
+	g_cm.GetStatus(&g_status);
+	double motorRpm = (double)g_status.axesStatus[ax].actualVelocity;
+	double vCurPps = HBC_RpmToPps(motorRpm, g_hbc.motorCpr);
 
-			// 새 시퀀스 시작 시 Start 쪽에서 stopDelayTimer를 0으로 초기화해 둔다고 가정
-			// 0일 때만 70으로 세팅해서 "누적" 개념 유지
-			if (g_hbc.stopDelayTimer == 0)
-				g_hbc.stopDelayTimer = 70;   // 30ms × 70 ≒ 2.1s
+	// measured decel update (EMA)
+	if (!g_hbc.havePrevV) {
+		g_hbc.havePrevV = true;
+		g_hbc.vPrevPps = vCurPps;
+	}
+	else {
+		double dv = g_hbc.vPrevPps - vCurPps; // + when decelerating
+		double aInst = dv / dtSec;            // pps^2
+		g_hbc.vPrevPps = vCurPps;
+
+		if (aInst > 50.0) {
+			const double alpha = 0.15;
+			if (g_hbc.aDecEma <= 0.0) g_hbc.aDecEma = aInst;
+			else g_hbc.aDecEma = (1.0 - alpha) * g_hbc.aDecEma + alpha * aInst;
 		}
+	}
 
-		// deadband 안에 있는 동안에만 타이머 감소
-		if (g_hbc.stopDelayActive)
+	// ===== Overshoot detect =====
+	int sgn = HBC_signll(bcErr);
+
+	if (g_hbc.forbidReverse)
+	{
+		if (g_hbc.lastErrSign != 0 && sgn != 0 && sgn != g_hbc.lastErrSign)
+			g_hbc.signFlipTicks++;
+		else
+			g_hbc.signFlipTicks = 0;
+
+		if (g_hbc.signFlipTicks >= overshootConfirmTicks)
 		{
-			if (--g_hbc.stopDelayTimer <= 0)
-			{
-				g_hbc.running = false;
-				g_hbc.inCorr = false;
-				g_hbc.stopDelayActive = false;
-				g_hbc.stopDelayTimer = 0;
-				return;    // 여기서 종료
-			}
+			g_hbc.running = false;
+			g_hbc.phase = HybridBarcodeState::IDLE;
+			g_hbc.stopCooldownUntil = GetTickCount64() + 300;
+			StopAxis(ax);
+			MessageBox(hWnd,
+				TEXT("Overshoot detected (target crossed). Motion stopped.\n")
+				TEXT("변환계수(bcMmPerCnt/gear) 또는 감속(ms) 튜닝을 확인하세요."),
+				TEXT("Hybrid Barcode"), MB_ICONWARNING);
+			return;
 		}
 	}
 	else
 	{
-		// deadband 밖: 타이머는 멈춰 있고 값만 유지 (pause)
-		// g_hbc.stopDelayActive / stopDelayTimer 둘 다 건드리지 않음
+		g_hbc.signFlipTicks = 0;
 	}
+	if (sgn != 0) g_hbc.lastErrSign = sgn;
 
+	HbcSnapshot snap{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
+	long long pulsesPerCnt = llabs(HBC_bcToPulses(snap, 1));
 
-	// ============ ENTER CORR ============
-	if (!g_hbc.inCorr && eAbs <= g_hbc.startBcErr) {
-		g_hbc.inCorr = true;
-	}
-
-	if (!g_hbc.inCorr) return;
-
-	// =========================================================
-	// CASE 1) startErr 조건 만족 → 첫 번째 보정 (correction profile 사용)
-	// =========================================================
-	if (!g_hbc.finalSnapSent && eAbs <= g_hbc.startBcErr)
+	// ==========================================================
+	// PHASE: COARSE_BRAKE (StopAxis 없이 프로파일 감속으로 0속도 만들기)
+	// ==========================================================
+	if (g_hbc.phase == HybridBarcodeState::COARSE_BRAKE)
 	{
-		HbcSnapshot s{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
-		long long remainingPulses = HBC_bcToPulses(s, bcErr);
+		// 0속도 근처 도달하면 FINE로 전환
+		if (vCurPps <= g_hbc.coarseStopVelThreshPps)
+		{
+			// final 목표로 FINE 접근
+			g_hbc.phase = HybridBarcodeState::FINE;
+			g_hbc.arriveStableTicks = 0;
 
-		g_cm.GetStatus(&g_status);
+			long long finalErr = g_hbc.targetBarcodeAbs - (long long)now6063;
+			g_hbc.lastErrSign = HBC_signll(finalErr);
+			g_hbc.signFlipTicks = 0;
+
+			// 전환 직후 명령 충돌 방지
+			g_hbc.fineStartCooldownUntil = GetTickCount64() + 120;
+
+			// 커맨드 갱신 유도
+			g_hbc.lastCmdVel = 0;
+			g_hbc.lastCmdTarget = 0;
+		}
+		return;
+	}
+
+	// ==========================================================
+	// PHASE: COARSE (목표-10cnt로 접근하다가, 근처에서 ProfileStop 발동)
+	// ==========================================================
+	if (g_hbc.phase == HybridBarcodeState::COARSE)
+	{
+		// 도착 판정(±1cnt 안정화) -> StopAxis 대신 ProfileStop -> COARSE_BRAKE
+		if (bcErrAbs <= g_hbc.coarseArriveCnt)
+		{
+			if (++g_hbc.coarseStableTicks >= g_hbc.coarseStableTicksNeed)
+			{
+				// ✅ StopAxis(ax) 대신 프로파일 감속 정지
+				HBC_ProfileStop(ax, g_hbc.coarseBrakeVelPps, g_hbc.coarseBrakeAccMs, g_hbc.coarseBrakeDecMs);
+
+				g_hbc.stopCooldownUntil = GetTickCount64() + 120;
+				g_hbc.fineStartCooldownUntil = g_hbc.stopCooldownUntil;
+
+				g_hbc.coarseStableTicks = 0;
+				g_hbc.phase = HybridBarcodeState::COARSE_BRAKE;
+				return;
+			}
+			return;
+		}
+		g_hbc.coarseStableTicks = 0;
+
+		// COARSE: stop-distance 기반 감속(목표는 coarseTarget)
+		long long remainingPulses = HBC_bcToPulses(snap, bcErr);
+		long long distAbs = llabs(remainingPulses);
+
+		auto safe_sqrt_scale = [](double base, double refVel, double vel, double lo, double hi) {
+			double v = std::max(1.0, vel);
+			double scale = std::sqrt(std::max(0.2, refVel / v));
+			return std::clamp(base * scale, lo, hi);
+			};
+
+		double mainDecSafety = safe_sqrt_scale(0.28, 5000.0, g_hbc.mainVel, 0.15, 0.35);
+		double aMainModel = HBC_DecelPps2_Model(g_hbc.mainVel, g_hbc.mainDec, mainDecSafety);
+
+		double aMeas = (g_hbc.aDecEma > 0.0) ? g_hbc.aDecEma : 0.0;
+		double aMainDec = (aMeas > 0.0) ? std::min(aMeas, aMainModel * 1.2) : aMainModel;
+
+		double stopDistNow = HBC_StopDistPulses(vCurPps, aMainDec);
+
+		long long marginPulses =
+			(long long)(pulsesPerCnt * 6) +        // coarse는 6cnt
+			(long long)(vCurPps * 0.15) +          // 150ms 선행
+			(long long)(stopDistNow * 0.10) +      // 10% 버퍼
+			300;
+
+		if (marginPulses < pulsesPerCnt * 6) marginPulses = pulsesPerCnt * 6;
+
+		double distForPlan = (double)distAbs - (double)marginPulses;
+		if (distForPlan < 0) distForPlan = 0;
+
+		double vEnvMain = std::min(g_hbc.mainVel, HBC_VelLimitFromDist(distForPlan, aMainDec));
+
+		// COARSE도 너무 가까우면 천천히
+		if (bcErrAbs <= (g_hbc.preStopCnt + 10))
+			vEnvMain = std::min(vEnvMain, std::max(200.0, g_hbc.creepVel));
+
+		if (vEnvMain < 50.0 && distAbs > 0) vEnvMain = 50.0;
+
 		long long curPos = g_status.axesStatus[ax].actualPos;
-
 		long long absTarget = curPos + remainingPulses;
 
-		// 첫 번째 보정 실행 - correction profile
-		StartAbsMoveWithProfile(ax, absTarget, g_hbc.corrVel, g_hbc.corrAcc, g_hbc.corrDec);
+		DWORD period = (bcErrAbs <= 80) ? 40 : 90;
+		double ratio = (bcErrAbs <= 80) ? 0.05 : 0.12;
 
-		g_hbc.finalSnapSent = true;
+		HBC_SendMoveThrottled(ax, absTarget, vEnvMain, g_hbc.mainAcc, g_hbc.mainDec, ratio,
+			/*minTargetDeltaPulses*/ pulsesPerCnt, period);
+
 		return;
 	}
 
-	// =========================================================
-	// CASE 2) finalSnapSent == true → actVel == 0일 때 최종 점검 (correction profile 사용)
-	// =========================================================
-	if (g_hbc.finalSnapSent)
+	// ==========================================================
+	// PHASE: FINE (final target로 step 이동 → ±2cnt)
+	// ==========================================================
+	if (g_hbc.phase == HybridBarcodeState::FINE)
 	{
-		g_cm.GetStatus(&g_status);
-		double actVel = fabs(g_status.axesStatus[ax].actualVelocity);
+		long long finalErr = g_hbc.targetBarcodeAbs - (long long)now6063;
+		long long finalErrAbs = llabs(finalErr);
 
-		if (actVel == 0 && eAbs > finalCheckErr)
+		if (finalErrAbs <= g_hbc.arriveCnt)
 		{
-			HbcSnapshot s{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
-			long long remainingPulses = HBC_bcToPulses(s, bcErr);
-			long long curPos = g_status.axesStatus[ax].actualPos;
-			long long absTarget = curPos + remainingPulses;
+			if (++g_hbc.arriveStableTicks >= g_hbc.arriveStableTicksNeed)
+			{
+				g_hbc.running = false;
+				g_hbc.phase = HybridBarcodeState::DONE;
+				g_hbc.stopCooldownUntil = GetTickCount64() + 300;
+				StopAxis(ax); // final에서는 이미 저속이라 충격 작음(원하면 ProfileStop으로 바꿔도 됨)
+				return;
+			}
+			return;
+		}
+		g_hbc.arriveStableTicks = 0;
 
-			// 두 번째 보정 실행 - correction profile
-			StartAbsMoveWithProfile(ax, absTarget, g_hbc.corrVel, g_hbc.corrAcc, g_hbc.corrDec);
+		long long remainingPulses = HBC_bcToPulses(snap, finalErr);
+
+		long long stepMaxPulses = llabs(HBC_bcToPulses(snap, (long long)g_hbc.fineStepCntMax));
+		if (stepMaxPulses < 1) stepMaxPulses = 1;
+
+		long long stepPulses = remainingPulses;
+		if (stepPulses > stepMaxPulses) stepPulses = stepMaxPulses;
+		if (stepPulses < -stepMaxPulses) stepPulses = -stepMaxPulses;
+
+		if (finalErrAbs <= 10) {
+			long long oneCntPulse = llabs(HBC_bcToPulses(snap, 1));
+			stepPulses = std::clamp(stepPulses, -std::max(1LL, oneCntPulse), std::max(1LL, oneCntPulse));
 		}
 
-		// 이후에는 더 이상 명령을 보내지 않고 deadband 진입까지 대기
+		double vPlan = std::min(g_hbc.corrVel, g_hbc.creepVel);
+		if (finalErrAbs <= g_hbc.creepCnt)
+			vPlan = std::min(vPlan, g_hbc.creepVel);
+
+		if (finalErrAbs <= 6) vPlan = std::min(vPlan, 200.0);
+		if (vPlan < 20.0) vPlan = 20.0;
+
+		long long curPos = g_status.axesStatus[ax].actualPos;
+		long long absTarget = curPos + stepPulses;
+
+		HBC_SendMoveThrottled(ax, absTarget, vPlan, g_hbc.corrAcc, g_hbc.corrDec,
+			0.01, 1, 80);
+
 		return;
 	}
 
-	// =========================================================
-	// CASE 3) snapErr 근처가 아닌 normal correction loop (correction profile 사용)
-	// =========================================================
-	HbcSnapshot s{ g_hbc.gear, g_hbc.wheelDia, g_hbc.motorCpr, g_hbc.bcMmPerCnt };
-	long long remainingPulses = HBC_bcToPulses(s, bcErr);
-
-	g_cm.GetStatus(&g_status);
-	long long curPos = g_status.axesStatus[ax].actualPos;
-
-	long long absTarget = curPos + remainingPulses;
-
-	StartAbsMoveWithProfile(ax, absTarget, g_hbc.corrVel, g_hbc.corrAcc, g_hbc.corrDec);
+	// DONE/IDLE
+	return;
 }
-
 
 // =====================================================
 // UI and Window Proc
@@ -4015,10 +4329,10 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
 			65, 36, 80, 200, hWnd, (HMENU)ID_BC_COMBO_AXIS, 0, 0);
 
-		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("0"));
-		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("1"));
-		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("2"));
-		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("3"));
+		for (int i = 0; i <= 8; ++i) {
+			wchar_t tmp[8]; swprintf_s(tmp, L"%d", i);
+			SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)tmp);
+		}
 		SendMessage(hAxis, CB_SETCURSEL, g_hbc.axis, 0);
 
 		// NOW(6063)
@@ -4077,7 +4391,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE,
 			500, 155, 90, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("1000"),
+		CreateWindow(TEXT("EDIT"), TEXT("300"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			590, 153, 90, 24, hWnd, (HMENU)ID_BC_EDIT_CORR_ACC, 0, 0);
 
@@ -4085,7 +4399,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE,
 			690, 155, 90, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("1000"),
+		CreateWindow(TEXT("EDIT"), TEXT("300"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			780, 153, 90, 24, hWnd, (HMENU)ID_BC_EDIT_CORR_DEC, 0, 0);
 
@@ -4094,7 +4408,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE,
 			20, 155, 100, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("4.3"),
+		CreateWindow(TEXT("EDIT"), TEXT("4.4248"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			125, 153, 90, 24, hWnd, (HMENU)ID_BC_EDIT_GEAR, 0, 0);
 
@@ -4102,7 +4416,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE,
 			20, 190, 100, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("70"),
+		CreateWindow(TEXT("EDIT"), TEXT("115"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			125, 188, 90, 24, hWnd, (HMENU)ID_BC_EDIT_WHEEL_D, 0, 0);
 
@@ -4118,12 +4432,12 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE,
 			230, 190, 110, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("0.1"),
+		CreateWindow(TEXT("EDIT"), TEXT("1.07"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			330, 188, 90, 24, hWnd, (HMENU)ID_BC_EDIT_BC_MM_PER_CNT, 0, 0);
 
-		// COMPUTED PULSES
-		CreateWindow(TEXT("STATIC"), TEXT("Computed Pulses"),
+		// COMPUTED PULSES (remaining)
+		CreateWindow(TEXT("STATIC"), TEXT("Remaining Pulses"),
 			WS_CHILD | WS_VISIBLE,
 			20, 225, 140, 22, hWnd, 0, 0, 0);
 
@@ -4131,39 +4445,40 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			165, 223, 150, 24, hWnd, (HMENU)ID_BC_TXT_COMPUTED_PULSES, 0, 0);
 
-		// CORRECTION SETTINGS
-		CreateWindow(TEXT("STATIC"), TEXT("Deadband(cnt)"),
+		// ARRIVE RANGE (표시용)
+		CreateWindow(TEXT("STATIC"), TEXT("Arrive band(±cnt)"),
 			WS_CHILD | WS_VISIBLE,
 			330, 225, 120, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("2"),
+		CreateWindow(TEXT("STATIC"), TEXT("2"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
 			455, 223, 80, 24, hWnd, (HMENU)ID_BC_EDIT_CORR_DEADBAND, 0, 0);
 
-		CreateWindow(TEXT("STATIC"), TEXT("Start Corr (bcErr)"),
+		// Auto corr entry dist display
+		CreateWindow(TEXT("STATIC"), TEXT("Auto Corr EntryDist(pulse)"),
 			WS_CHILD | WS_VISIBLE,
-			550, 225, 130, 22, hWnd, 0, 0, 0);
+			550, 225, 200, 22, hWnd, 0, 0, 0);
 
-		CreateWindow(TEXT("EDIT"), TEXT("100"),
+		CreateWindow(TEXT("STATIC"), TEXT("-"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
-			685, 223, 90, 24, hWnd, (HMENU)ID_BC_EDIT_CORR_START_BCERR, 0, 0);
+			760, 223, 160, 24, hWnd, (HMENU)ID_BC_EDIT_CORR_START_BCERR, 0, 0);
 
 		// BUTTONS
 		CreateWindow(TEXT("BUTTON"), TEXT("Servo ON"),
 			WS_CHILD | WS_VISIBLE,
-			780, 223, 90, 26, hWnd, (HMENU)ID_BC_BTN_SERVO_ON, 0, 0);
+			930, 223, 80, 26, hWnd, (HMENU)ID_BC_BTN_SERVO_ON, 0, 0);
 
 		CreateWindow(TEXT("BUTTON"), TEXT("Servo OFF"),
 			WS_CHILD | WS_VISIBLE,
-			875, 223, 90, 26, hWnd, (HMENU)ID_BC_BTN_SERVO_OFF, 0, 0);
+			1015, 223, 80, 26, hWnd, (HMENU)ID_BC_BTN_SERVO_OFF, 0, 0);
 
 		CreateWindow(TEXT("BUTTON"), TEXT("Start"),
 			WS_CHILD | WS_VISIBLE,
-			780, 255, 90, 26, hWnd, (HMENU)ID_BC_BTN_START, 0, 0);
+			930, 255, 80, 26, hWnd, (HMENU)ID_BC_BTN_START, 0, 0);
 
 		CreateWindow(TEXT("BUTTON"), TEXT("Stop"),
 			WS_CHILD | WS_VISIBLE,
-			875, 255, 90, 26, hWnd, (HMENU)ID_BC_BTN_STOP, 0, 0);
+			1015, 255, 80, 26, hWnd, (HMENU)ID_BC_BTN_STOP, 0, 0);
 
 		// STATUS
 		CreateWindow(TEXT("STATIC"), TEXT("Status"),
@@ -4172,7 +4487,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 		CreateWindow(TEXT("STATIC"), TEXT("-"),
 			WS_CHILD | WS_VISIBLE | WS_BORDER,
-			90, 288, 980, 24, hWnd, (HMENU)ID_BC_TXT_STATUS, 0, 0);
+			90, 288, 1000, 50, hWnd, (HMENU)ID_BC_TXT_STATUS, 0, 0);
 
 		// TIMER
 		SetTimer(hWnd, ID_BC_TIMER, 30, nullptr);
@@ -4211,13 +4526,12 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		if (id == ID_BC_BTN_STOP)
 		{
 			g_hbc.running = false;
-			g_hbc.inCorr = false;
-			g_hbc.finalSnapSent = false;
-
-			// 항상 재시작할 때 초기화
-			g_hbc.stopDelayActive = false;
-			g_hbc.stopDelayTimer = 0;
-
+			g_hbc.phase = HybridBarcodeState::IDLE;
+			g_hbc.arriveStableTicks = 0;
+			g_hbc.coarseStableTicks = 0;
+			g_hbc.signFlipTicks = 0;
+			g_hbc.stopCooldownUntil = GetTickCount64() + 300;
+			g_hbc.fineStartCooldownUntil = g_hbc.stopCooldownUntil;
 			StopAxis(g_hbc.axis);
 			return 0;
 		}
@@ -4228,10 +4542,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		if (wParam == ID_BC_TIMER)
 		{
 			HBC_UpdateUi(hWnd);
-
-			if (g_hbc.running)
-				HBC_Poll(hWnd);
-
+			if (g_hbc.running) HBC_Poll(hWnd);
 			return 0;
 		}
 		break;
@@ -4241,14 +4552,12 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		return 0;
 
 	case WM_DESTROY:
-		if (g_hBarcodeWnd == hWnd)
-			g_hBarcodeWnd = nullptr;
+		if (g_hBarcodeWnd == hWnd) g_hBarcodeWnd = nullptr;
 		return 0;
 	}
 
 	return DefWindowProc(hWnd, msg, wParam, lParam);
 }
-
 
 // =====================================================
 // Show Window
@@ -4287,6 +4596,11 @@ void ShowBarcodeDemoWindow(HWND parent)
 		SetForegroundWindow(g_hBarcodeWnd);
 	}
 }
+
+
+
+
+
 
 // ------------------ 메인 윈도우 ------------------
 #define ID_BTN_DEMO_MAIN 9602
@@ -4438,7 +4752,7 @@ struct AxisParam {
 	double altTarget = 0.0;
 };
 // 축별 파라미터(축을 바꿔도 저장/복원)
-static AxisParam g_axisParam[kNumAxes];
+static AxisParam g_axisParam[kNumAxes - 3];
 
 // Selected 그룹(A/B/C/D)이 제어할 축 (중복 불가)
 static int g_selGroupAxis[4] = { 0, 1, 2, 3 };
@@ -4446,12 +4760,12 @@ static int g_selGroupAxis[4] = { 0, 1, 2, 3 };
 static int GetGroupAxisByIndex(int idx) {
 	if (idx < 0 || idx >= 4) return 0;
 	int ax = g_selGroupAxis[idx];
-	if (ax < 0 || ax >= kNumAxes) ax = 0;
+	if (ax < 0 || ax >= kNumAxes - 3) ax = 0;
 	return ax;
 }
 static void SetGroupAxisByIndex(int idx, int axis) {
 	if (idx < 0 || idx >= 4) return;
-	if (axis < 0 || axis >= kNumAxes) axis = 0;
+	if (axis < 0 || axis >= kNumAxes - 3) axis = 0;
 	g_selGroupAxis[idx] = axis;
 }
 
@@ -4494,7 +4808,7 @@ static SelIds GetSelIds(int groupIdx) {
 }
 
 static AxisParam& GetAxisParam(int axis) {
-	if (axis < 0 || axis >= kNumAxes) axis = 0;
+	if (axis < 0 || axis >= kNumAxes - 3) axis = 0;
 	return g_axisParam[axis];
 }
 
@@ -4517,11 +4831,11 @@ static int Combo_GetAxis(HWND hCombo) {
 	if (sel < 0) return 0;
 	LRESULT data = SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
 	int axis = (data == CB_ERR) ? sel : (int)data;
-	if (axis < 0 || axis >= kNumAxes) axis = 0;
+	if (axis < 0 || axis >= kNumAxes - 3) axis = 0;
 	return axis;
 }
 static void Combo_SetAxis(HWND hCombo, int axis) {
-	if (axis < 0 || axis >= kNumAxes) axis = 0;
+	if (axis < 0 || axis >= kNumAxes - 3) axis = 0;
 	int cnt = (int)SendMessage(hCombo, CB_GETCOUNT, 0, 0);
 	for (int i = 0; i < cnt; ++i) {
 		LRESULT data = SendMessage(hCombo, CB_GETITEMDATA, i, 0);
@@ -4573,11 +4887,11 @@ static void LoadAxisParamToUi(HWND hWnd, int groupIdx) {
 static void RefreshSelAxisCombos(HWND hWnd) {
 	SelUiUpdateGuard __guard;
 	// 중복/범위 오류 자동 복구
-	bool used[kNumAxes] = { false };
+	bool used[kNumAxes - 3] = { false };
 	for (int g = 0; g < 4; ++g) {
 		int ax = GetGroupAxisByIndex(g);
-		if (ax < 0 || ax >= kNumAxes || used[ax]) {
-			for (int a = 0; a < kNumAxes; ++a) if (!used[a]) { ax = a; break; }
+		if (ax < 0 || ax >= kNumAxes - 3 || used[ax]) {
+			for (int a = 0; a < kNumAxes - 3; ++a) if (!used[a]) { ax = a; break; }
 			SetGroupAxisByIndex(g, ax);
 		}
 		used[ax] = true;
@@ -4593,7 +4907,7 @@ static void RefreshSelAxisCombos(HWND hWnd) {
 		int curAxis = selAx[g];
 		SendMessage(hCombo, CB_RESETCONTENT, 0, 0);
 
-		for (int a = 0; a < kNumAxes; ++a) {
+		for (int a = 0; a < kNumAxes - 3; ++a) {
 			bool taken = false;
 			for (int og = 0; og < 4; ++og) {
 				if (og == g) continue;
@@ -4810,7 +5124,7 @@ static void Multi_DoAbs(HWND hWnd) {
 	std::vector<SlaveInfo> slaveSkipped;
 	std::vector<int> alreadyAtTarget;
 
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
 
 		int gid = -1, master = -1;
@@ -4873,7 +5187,7 @@ static void Multi_DoRel(HWND hWnd) {
 	std::vector<SlaveInfo> slaveSkipped;
 	std::vector<int> zeroStep;
 
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
 
 		int gid = -1, master = -1;
@@ -4935,7 +5249,7 @@ static void Multi_DoJog(HWND hWnd, int sign) {
 	// Reset any previous multi-jog bookkeeping
 	g_multiJogActive = false;
 	g_multiJogSign = 0;
-	for (int a = 0; a < kNumAxes; ++a) g_multiJogAxisActive[a] = false;
+	for (int a = 0; a < kNumAxes - 3; ++a) g_multiJogAxisActive[a] = false;
 
 	g_cm.GetStatus(&g_status);
 
@@ -4944,7 +5258,7 @@ static void Multi_DoJog(HWND hWnd, int sign) {
 
 	bool anyStarted = false;
 
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
 
 		int gid = -1, master = -1;
@@ -5019,7 +5333,7 @@ static void Multi_DoJog(HWND hWnd, int sign) {
 static void Multi_DoHome(HWND hWnd) {
 	if (!IsManualAllowed(hWnd)) return;
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Home(Checked)"), MB_ICONWARNING); return; }
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a)) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a)) {
 		if (!EnsureServoOn(a)) continue;
 		g_cm.motion->Stop(a); g_cm.velocity->Stop(a); if (g_cm.torque) g_cm.torque->StopTrq(a);
 		if (EnterPosMode(a)) { long e = g_home.StartHome(a); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Home 시작 실패"), e, g_wmx); }
@@ -5029,21 +5343,21 @@ static void Multi_DoHome(HWND hWnd) {
 
 static void Multi_DoSvOn(HWND hWnd) {
 	if (!IsManualAllowed(hWnd)) return;
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a)) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a)) {
 		long e = g_cm.axisControl->SetServoOn(a, 1); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo ON(Selected) 실패"), e, g_wmx);
 	}
 }
 static void Multi_DoSvOff(HWND hWnd) {
 	if (!IsManualAllowed(hWnd)) return;
 	StopMultiJog();
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a)) {
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a)) {
 		long e = g_cm.axisControl->SetServoOn(a, 0); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo OFF(Selected) 실패"), e, g_wmx);
 	}
 }
 static void Multi_DoStop(HWND hWnd) {
 	if (!IsManualAllowed(hWnd)) return;
 	StopMultiJog();
-	for (int a = 0; a < kNumAxes; ++a) if (IsAxisChecked(hWnd, a)) StopAxis(a);
+	for (int a = 0; a < kNumAxes - 3; ++a) if (IsAxisChecked(hWnd, a)) StopAxis(a);
 }
 static void Multi_DoAlarmReset(HWND hWnd) { if (!IsManualAllowed(hWnd)) return; DoMultiAlarmReset(hWnd); }
 
@@ -5277,7 +5591,7 @@ static void CreateUI_MainRebuild(HWND h)
 	// 선택 체크박스 (0~8축)
 	int chkTop = cy2 + 40;
 	CreateWindow(TEXT("STATIC"), TEXT("Selected: (none)"), WS_CHILD | WS_VISIBLE | SS_LEFT, 850, chkTop, 250, 20, h, (HMENU)ID_TXT_SELECTED_AXES, 0, 0);
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		int xx = 20 + a * 90;
 		TCHAR cap[16]; _stprintf_s(cap, TEXT("Axis %d"), a);
 		CreateWindow(TEXT("BUTTON"), cap, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
@@ -5286,7 +5600,7 @@ static void CreateUI_MainRebuild(HWND h)
 
 	// ================= 상태 테이블 (작은 글꼴) =================
 	int statusTop = group2Top + 120;
-	int statusH = 24 + (kNumAxes * (20 + 3)) + 30;
+	int statusH = 24 + (kNumAxes - 3 * (20 + 3)) + 30;
 	CreateWindow(TEXT("BUTTON"), TEXT("Status"), WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, statusTop, 1670, statusH, h, nullptr, nullptr, nullptr);
 
 	int ox = 20, oy = statusTop + 24, colW = 100, rowH = 20;
@@ -5309,7 +5623,7 @@ static void CreateUI_MainRebuild(HWND h)
 	for (HWND lab : labels) if (lab) SendMessage(lab, WM_SETFONT, (WPARAM)GetSmallFont(), TRUE);
 
 	oy += rowH + 3;
-	for (int a = 0; a < kNumAxes; ++a) {
+	for (int a = 0; a < kNumAxes - 3; ++a) {
 		TCHAR lab[16]; _stprintf_s(lab, TEXT("Axis %d"), a);
 		HWND stA = CreateWindow(TEXT("STATIC"), lab, WS_CHILD | WS_VISIBLE | SS_CENTER, ox, oy + a * (rowH + 3), 60, rowH, h, nullptr, nullptr, nullptr);
 
@@ -5369,10 +5683,10 @@ static void AutoStart(HWND hWnd)
 	}
 
 	// Servo ON
-	for (int a = 0; a < kNumAxes; ++a) {
+	/*for (int a = 0; a < kNumAxes-3; ++a) {
 		EnsureServoOn(a);
 		EnsurePosModeNoStop(a);
-	}
+	}*/
 
 	//std::this_thread::sleep_for(std::chrono::seconds(3));
 	//// Sync Group 0: Master=0, Slave=[1]
@@ -5526,7 +5840,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		if (id == ID_BTN_ESTOP_TOGGLE) { DoToggleEStop(hWnd, false); return 0; }
 
 		// 체크박스 9축
-		if (id >= ID_CHECK_AXIS(0) && id <= ID_CHECK_AXIS(kNumAxes - 1)) {
+		if (id >= ID_CHECK_AXIS(0) && id <= ID_CHECK_AXIS(kNumAxes - 3)) {
 			if (code == BN_CLICKED) UpdateSelectedAxesTextOnDemand(hWnd);
 			return 0;
 		}
@@ -5883,7 +6197,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		KillTimer(hWnd, ID_TIMER);
 		StopJogIfActive(); StopMultiJog();
 		g_demoRunning = false;
-		for (int a = 0; a < kNumAxes; ++a) StopAxis(a);
+		for (int a = 0; a < kNumAxes - 3; ++a) StopAxis(a);
 		StopTcpServer();
 
 		ShutdownWMX();
