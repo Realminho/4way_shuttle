@@ -890,6 +890,7 @@ inline int ID_CHECK_AXIS(int axis) { return ID_CHECK_AXIS_BASE + axis; }
 #define ID_BTN_MODE_AUTO   7261
 #define ID_TXT_MODE_STATE  7262
 
+#define ID_BTN_VELCONV_MAIN 7270
 inline int ID_TXT_STATUS(int axis, int col) { return 8000 + axis * 30 + col; }
 #define ID_TXT_SELECTED_AXES 9000
 #define ID_TXT_ZONE_ANNOUNCE 9100
@@ -981,6 +982,7 @@ enum : int {
 	ID_SYNC_ALL_SERVO_OFF = 10403,
 	ID_SYNC_GROUP_HOME = 10404,
 	ID_SYNC_GROUP_CLEAR = 10405,
+	ID_SYNC_BTN_VELCONV = 10406,
 
 	ID_SYNC_AXIS_LIST = 10450,
 
@@ -990,6 +992,56 @@ enum : int {
 	ID_SYNC_BTN_ESTOP_TOGGLE = 14000,
 	ID_SYNC_TXT_ESTOP_STATE = 14001
 };
+
+// ==== ActualVel(rpm) -> m/s conversion settings window ====
+// Default: all axes disabled. User can enable per-axis conversion from UI.
+// NOTE: WMX3 axis config in this program auto-applies gear ratio at startup.
+//       Therefore, do NOT add gear ratio in this conversion formula.
+
+static HWND g_hVelConvWnd = nullptr;
+
+// Axis count shown in Sync window is (kNumAxes - 3) ...
+static const int kSyncUiAxes = (kNumAxes - 3);
+
+// Per-axis flags/params (0..8). Default off.
+static bool   g_velToMS_Enable[kSyncUiAxes] = {};
+static double g_velToMS_WheelDiameterMM[kSyncUiAxes] = {};
+static int    g_velToMS_PulsesPerRev[kSyncUiAxes] = {};
+
+// Defaults requested by user for axis7 (still disabled by default)
+static void InitVelConvDefaultsOnce() {
+	static bool inited = false;
+	if (inited) return;
+	inited = true;
+	for (int i = 0; i < kSyncUiAxes; ++i) {
+		g_velToMS_Enable[i] = false;
+		g_velToMS_WheelDiameterMM[i] = 0.0;
+		g_velToMS_PulsesPerRev[i] = 0;
+	}
+	if (7 >= 0 && 7 < kSyncUiAxes) {
+		g_velToMS_WheelDiameterMM[7] = 115.0;
+		g_velToMS_PulsesPerRev[7] = 10000;
+	}
+}
+
+static double RpmToMps(double rpm, double wheelDiameterMM) {
+	// rpm -> rps: rpm/60
+	// distance per rev: pi * D
+	if (!(wheelDiameterMM > 0.0)) return NAN;
+	double Dm = wheelDiameterMM / 1000.0;
+	constexpr double kPi = 3.1415926535897932384626433832795;
+	return (rpm / 60.0) * (kPi * Dm);
+}
+
+// VelConv window control IDs
+#define ID_VELCONV_AXIS_CHK_BASE   15000
+#define ID_VELCONV_DIAM_EDIT_BASE  15100
+#define ID_VELCONV_PPR_EDIT_BASE   15200
+#define ID_VELCONV_BTN_APPLY       15300
+#define ID_VELCONV_BTN_CLOSE       15301
+
+static LRESULT CALLBACK VelConvWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+static void ShowVelConvWindow(HWND hParent);
 
 // ======================================================
 
@@ -2792,7 +2844,8 @@ static void Sync_CreateAxisListColumns(HWND hList) {
 	col.pszText = const_cast<LPTSTR>(TEXT("ActualPos")); col.cx = 100; col.iSubItem = 4; ListView_InsertColumn(hList, 4, &col);
 	col.pszText = const_cast<LPTSTR>(TEXT("CmdVel")); col.cx = 80; col.iSubItem = 5; ListView_InsertColumn(hList, 5, &col);
 	col.pszText = const_cast<LPTSTR>(TEXT("ActVel")); col.cx = 80; col.iSubItem = 6; ListView_InsertColumn(hList, 6, &col);
-	col.pszText = const_cast<LPTSTR>(TEXT("Err(603F)")); col.cx = 100; col.iSubItem = 7; ListView_InsertColumn(hList, 7, &col);
+	col.pszText = const_cast<LPTSTR>(TEXT("ActVel(m/s)")); col.cx = 90; col.iSubItem = 7; ListView_InsertColumn(hList, 7, &col);
+	col.pszText = const_cast<LPTSTR>(TEXT("Err(603F)")); col.cx = 100; col.iSubItem = 8; ListView_InsertColumn(hList, 8, &col);
 }
 
 static int StartupEnumToComboIndex(Sync::SyncGroupStartupType::T t) {
@@ -3164,12 +3217,146 @@ static void Sync_UpdateMonitor(HWND hWnd) {
 		_stprintf_s(buf, TEXT("%d"), (int)std::lround(a.actualVelocity));
 		ListView_SetItemText(hList, i, 6, buf);
 
+		// Optional conversion: actualVelocity(rpm) -> m/s
+		// (Enable per axis in the "m/s 설정..." window; default OFF)
+		{
+			InitVelConvDefaultsOnce();
+			if (ax >= 0 && ax < kSyncUiAxes && g_velToMS_Enable[ax]) {
+				double ms = RpmToMps(a.actualVelocity, g_velToMS_WheelDiameterMM[ax]);
+				if (std::isfinite(ms)) {
+					// 0.0001m/s 단위까지 표시 (필요하면 조정)
+					_stprintf_s(buf, TEXT("%.4f"), ms);
+				}
+				else {
+					_stprintf_s(buf, TEXT("-"));
+				}
+			}
+			else {
+				_stprintf_s(buf, TEXT("-"));
+			}
+			ListView_SetItemText(hList, i, 7, buf);
+		}
+		
 		int err603f = 0;
 		bool ok603f = ReadAxis_TxPDO_603F(kAxisSlaveId[ax], err603f);
 		if (ok603f) _stprintf_s(buf, TEXT("0x%04X"), (unsigned)(err603f & 0xFFFF));
 		else _stprintf_s(buf, TEXT("-"));
-		ListView_SetItemText(hList, i, 7, buf);
+		ListView_SetItemText(hList, i, 8, buf);
 	}
+}
+
+// ======================================================
+// ===== ActualVel(rpm) -> m/s conversion settings UI ====
+// ======================================================
+static void VelConv_CreateUI(HWND h) {
+	CreateWindow(TEXT("STATIC"), TEXT("축별 ActualVel(rpm) → m/s 변환"), WS_CHILD | WS_VISIBLE,
+		10, 10, 460, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("(체크된 축만 변환, 디폴트 OFF)"), WS_CHILD | WS_VISIBLE,
+		10, 30, 460, 18, h, nullptr, nullptr, nullptr);
+
+	// Header
+	CreateWindow(TEXT("STATIC"), TEXT("Axis"), WS_CHILD | WS_VISIBLE, 10, 55, 40, 18, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("Use"), WS_CHILD | WS_VISIBLE, 70, 55, 40, 18, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("Wheel D (mm)"), WS_CHILD | WS_VISIBLE, 150, 55, 90, 18, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("PPR(옵션)"), WS_CHILD | WS_VISIBLE, 280, 55, 70, 18, h, nullptr, nullptr, nullptr);
+
+	int y0 = 75;
+	for (int ax = 0; ax < kSyncUiAxes; ++ax) {
+		int y = y0 + ax * 26;
+		TCHAR t[16]; _stprintf_s(t, TEXT("%d"), ax);
+		CreateWindow(TEXT("STATIC"), t, WS_CHILD | WS_VISIBLE, 15, y + 4, 40, 18, h, nullptr, nullptr, nullptr);
+		CreateWindow(TEXT("BUTTON"), TEXT(""), WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+			70, y + 2, 18, 18, h, (HMENU)(INT_PTR)(ID_VELCONV_AXIS_CHK_BASE + ax), nullptr, nullptr);
+		CreateWindow(TEXT("EDIT"), TEXT("0"), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+			150, y, 100, 22, h, (HMENU)(INT_PTR)(ID_VELCONV_DIAM_EDIT_BASE + ax), nullptr, nullptr);
+		CreateWindow(TEXT("EDIT"), TEXT("0"), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+			280, y, 90, 22, h, (HMENU)(INT_PTR)(ID_VELCONV_PPR_EDIT_BASE + ax), nullptr, nullptr);
+	}
+
+	CreateWindow(TEXT("BUTTON"), TEXT("Apply"), WS_CHILD | WS_VISIBLE,
+		150, y0 + kSyncUiAxes * 26 + 10, 80, 28, h, (HMENU)ID_VELCONV_BTN_APPLY, nullptr, nullptr);
+	CreateWindow(TEXT("BUTTON"), TEXT("Close"), WS_CHILD | WS_VISIBLE,
+		240, y0 + kSyncUiAxes * 26 + 10, 80, 28, h, (HMENU)ID_VELCONV_BTN_CLOSE, nullptr, nullptr);
+
+	CreateWindow(TEXT("STATIC"),
+		TEXT("※ Wheel D(mm)만 있으면 rpm→m/s 변환 가능합니다.\r\n   (PPR은 참고용: 현재 계산에 사용하지 않음)"),
+		WS_CHILD | WS_VISIBLE, 10, y0 + kSyncUiAxes * 26 + 45, 460, 40, h, nullptr, nullptr, nullptr);
+}
+
+static void VelConv_LoadToControls(HWND h) {
+	InitVelConvDefaultsOnce();
+	for (int ax = 0; ax < kSyncUiAxes; ++ax) {
+		HWND chk = GetDlgItem(h, ID_VELCONV_AXIS_CHK_BASE + ax);
+		if (chk) SendMessage(chk, BM_SETCHECK, g_velToMS_Enable[ax] ? BST_CHECKED : BST_UNCHECKED, 0);
+		SetDlgDouble(h, ID_VELCONV_DIAM_EDIT_BASE + ax, g_velToMS_WheelDiameterMM[ax]);
+		SetDlgInt(h, ID_VELCONV_PPR_EDIT_BASE + ax, g_velToMS_PulsesPerRev[ax]);
+	}
+}
+
+static void VelConv_ApplyFromControls(HWND h) {
+	for (int ax = 0; ax < kSyncUiAxes; ++ax) {
+		HWND chk = GetDlgItem(h, ID_VELCONV_AXIS_CHK_BASE + ax);
+		g_velToMS_Enable[ax] = (chk && (SendMessage(chk, BM_GETCHECK, 0, 0) == BST_CHECKED));
+		g_velToMS_WheelDiameterMM[ax] = GetDlgDoubleOrDefIfInvalid(h, ID_VELCONV_DIAM_EDIT_BASE + ax, 0.0);
+		g_velToMS_PulsesPerRev[ax] = GetDlgInt(h, ID_VELCONV_PPR_EDIT_BASE + ax, 0);
+	}
+}
+
+static void ShowVelConvWindow(HWND hParent) {
+	InitVelConvDefaultsOnce();
+	if (g_hVelConvWnd && IsWindow(g_hVelConvWnd)) {
+		ShowWindow(g_hVelConvWnd, SW_SHOWNORMAL);
+		SetForegroundWindow(g_hVelConvWnd);
+		VelConv_LoadToControls(g_hVelConvWnd);
+		return;
+	}
+
+	WNDCLASS wc{};
+	wc.lpszClassName = TEXT("WMX3VelConvWnd");
+	wc.lpfnWndProc = VelConvWndProc;
+	wc.hInstance = (HINSTANCE)GetWindowLongPtr(hParent, GWLP_HINSTANCE);
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+	RegisterClass(&wc);
+
+	g_hVelConvWnd = CreateWindow(TEXT("WMX3VelConvWnd"), TEXT("m/s 변환 설정"),
+		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+		CW_USEDEFAULT, CW_USEDEFAULT, 500, 420, hParent, nullptr, wc.hInstance, nullptr);
+	ShowWindow(g_hVelConvWnd, SW_SHOWNORMAL);
+	UpdateWindow(g_hVelConvWnd);
+}
+
+static LRESULT CALLBACK VelConvWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	switch (msg) {
+	case WM_CREATE:
+		VelConv_CreateUI(hWnd);
+		VelConv_LoadToControls(hWnd);
+		return 0;
+
+	case WM_COMMAND:
+	{
+		int id = LOWORD(wParam);
+		if (id == ID_VELCONV_BTN_APPLY) {
+			VelConv_ApplyFromControls(hWnd);
+			MessageBox(hWnd, TEXT("적용되었습니다."), TEXT("m/s 변환"), MB_ICONINFORMATION);
+			return 0;
+		}
+		if (id == ID_VELCONV_BTN_CLOSE) {
+			DestroyWindow(hWnd);
+			return 0;
+		}
+		return 0;
+	}
+
+	case WM_CLOSE:
+		DestroyWindow(hWnd);
+		return 0;
+
+	case WM_DESTROY:
+		g_hVelConvWnd = nullptr;
+		return 0;
+	}
+	return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
 static void Sync_CreateUI(HWND h) {
@@ -3530,14 +3717,32 @@ static void UpdateStatus(HWND hWnd) {
 		_stprintf_s(buf, TEXT("%lld"), (long long)ax.actualPos); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 4))) SetWindowText(h, buf);
 		_stprintf_s(buf, TEXT("%d"), (int)std::lround(ax.velocityCmd)); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 5))) SetWindowText(h, buf);
 		_stprintf_s(buf, TEXT("%d"), actVel); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 6))) SetWindowText(h, buf);
-		_stprintf_s(buf, TEXT("%d"), (int)std::lround(ax.torqueCmd)); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 7))) SetWindowText(h, buf);
-		_stprintf_s(buf, TEXT("%d"), (int)std::lround(ax.actualTorque)); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 8))) SetWindowText(h, buf);
-		_stprintf_s(buf, TEXT("%lld"), perr); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 9))) SetWindowText(h, buf);
+
+		// ActVel(m/s) 출력: UI에서 축별로 Enable된 경우에만 표시 (기어비는 이미 적용된 rpm으로 가정)
+		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 7))) {
+			if (a >= 0 && a < kSyncUiAxes && g_velToMS_Enable[a]) {
+				double ms = RpmToMps(ax.actualVelocity, g_velToMS_WheelDiameterMM[a]);
+				if (std::isfinite(ms)) {
+					_stprintf_s(buf, TEXT("%.3f"), ms);
+					SetWindowText(h, buf);
+				}
+				else {
+					SetWindowText(h, TEXT("-"));
+				}
+			}
+			else {
+				SetWindowText(h, TEXT("-"));
+			}
+		}
+
+		_stprintf_s(buf, TEXT("%d"), (int)std::lround(ax.torqueCmd)); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 8))) SetWindowText(h, buf);
+		_stprintf_s(buf, TEXT("%d"), (int)std::lround(ax.actualTorque)); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 9))) SetWindowText(h, buf);
+		_stprintf_s(buf, TEXT("%lld"), perr); if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 10))) SetWindowText(h, buf);
 
 		bool ampAlm = false;
-		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 10))) SetWindowText(h, ampAlm ? (TCHAR*)TEXT("ALARM") : (TCHAR*)TEXT("OK"));
+		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 11))) SetWindowText(h, ampAlm ? (TCHAR*)TEXT("ALARM") : (TCHAR*)TEXT("OK"));
 
-		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 11))) {
+		if (HWND h = GetDlgItem(hWnd, ID_TXT_STATUS(a, 12))) {
 			int err603f = 0;
 			bool ok603f = ReadAxis_TxPDO_603F(kAxisSlaveId[a], err603f);
 			if (ok603f) {
@@ -5602,6 +5807,7 @@ static void CreateUI_MainRebuild(HWND h)
 	int statusTop = group2Top + 120;
 	int statusH = 24 + (kNumAxes - 3 * (20 + 3)) + 30;
 	CreateWindow(TEXT("BUTTON"), TEXT("Status"), WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, statusTop, 1670, statusH, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("BUTTON"), TEXT("m/s 설정..."), WS_CHILD | WS_VISIBLE, 1540, statusTop + 18, 110, 24, h, (HMENU)ID_BTN_VELCONV_MAIN, nullptr, nullptr);
 
 	int ox = 20, oy = statusTop + 24, colW = 100, rowH = 20;
 
@@ -5612,14 +5818,15 @@ static void CreateUI_MainRebuild(HWND h)
 	HWND lbl4 = CreateWindow(TEXT("STATIC"), TEXT("CmdPos"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 3, oy, colW, rowH, h, nullptr, nullptr, nullptr);
 	HWND lbl5 = CreateWindow(TEXT("STATIC"), TEXT("ActPos"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 4, oy, colW, rowH, h, nullptr, nullptr, nullptr);
 	HWND lbl6 = CreateWindow(TEXT("STATIC"), TEXT("CmdVel"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 5, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl7 = CreateWindow(TEXT("STATIC"), TEXT("ActVel"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 6, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl8 = CreateWindow(TEXT("STATIC"), TEXT("CmdTrq"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 7, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl9 = CreateWindow(TEXT("STATIC"), TEXT("ActTrq"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 8, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl10 = CreateWindow(TEXT("STATIC"), TEXT("PosErr"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 9, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl11 = CreateWindow(TEXT("STATIC"), TEXT("AmpAlarm"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 10, oy, colW, rowH, h, nullptr, nullptr, nullptr);
-	HWND lbl12 = CreateWindow(TEXT("STATIC"), TEXT("Err(0x603F)"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 11, oy, colW + 20, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl7 = CreateWindow(TEXT("STATIC"), TEXT("ActVel(rpm)"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 6, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl8 = CreateWindow(TEXT("STATIC"), TEXT("ActVel(m/s)"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 7, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl9 = CreateWindow(TEXT("STATIC"), TEXT("CmdTrq"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 8, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl10 = CreateWindow(TEXT("STATIC"), TEXT("ActTrq"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 9, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl11 = CreateWindow(TEXT("STATIC"), TEXT("PosErr"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 10, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl12 = CreateWindow(TEXT("STATIC"), TEXT("AmpAlarm"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 11, oy, colW, rowH, h, nullptr, nullptr, nullptr);
+	HWND lbl13 = CreateWindow(TEXT("STATIC"), TEXT("Err(0x603F)"), WS_CHILD | WS_VISIBLE | SS_CENTER, ox + 70 + colW * 12, oy, colW + 20, rowH, h, nullptr, nullptr, nullptr);
 
-	HWND labels[] = { lblAxis,lbl1,lbl2,lbl3,lbl4,lbl5,lbl6,lbl7,lbl8,lbl9,lbl10,lbl11,lbl12 };
+	HWND labels[] = { lblAxis,lbl1,lbl2,lbl3,lbl4,lbl5,lbl6,lbl7,lbl8,lbl9,lbl10,lbl11,lbl12,lbl13 };
 	for (HWND lab : labels) if (lab) SendMessage(lab, WM_SETFONT, (WPARAM)GetSmallFont(), TRUE);
 
 	oy += rowH + 3;
@@ -5637,10 +5844,11 @@ static void CreateUI_MainRebuild(HWND h)
 		HWND h7 = CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 7, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 7), nullptr, nullptr);
 		HWND h8 = CreateWindow(TEXT("STATIC"), TEXT("0"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 8, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 8), nullptr, nullptr);
 		HWND h9 = CreateWindow(TEXT("STATIC"), TEXT("0"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 9, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 9), nullptr, nullptr);
-		HWND h10 = CreateWindow(TEXT("STATIC"), TEXT("OK"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 10, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 10), nullptr, nullptr);
-		HWND h11 = CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 11, oy + a * (rowH + 3), colW + 20, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 11), nullptr, nullptr);
+		HWND h10 = CreateWindow(TEXT("STATIC"), TEXT("0"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 10, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 10), nullptr, nullptr);
+		HWND h11 = CreateWindow(TEXT("STATIC"), TEXT("OK"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 11, oy + a * (rowH + 3), colW, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 11), nullptr, nullptr);
+		HWND h12 = CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | WS_BORDER | SS_CENTER, ox + 70 + colW * 12, oy + a * (rowH + 3), colW + 20, rowH, h, (HMENU)(INT_PTR)ID_TXT_STATUS(a, 12), nullptr, nullptr);
 
-		HWND rowCtrls[] = { stA,h0,h1,h2,h3,h4,h5,h6,h7,h8,h9,h10,h11 };
+		HWND rowCtrls[] = { stA,h0,h1,h2,h3,h4,h5,h6,h7,h8,h9,h10,h11,h12 };
 		for (HWND rc : rowCtrls) if (rc) SendMessage(rc, WM_SETFONT, (WPARAM)GetSmallFont(), TRUE);
 	}
 }
@@ -5750,6 +5958,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		// 메인 UI 재배치
 		CreateUI_MainRebuild(hWnd);
 
+		InitVelConvDefaultsOnce();
+
 		SetTimer(hWnd, ID_TIMER, POLL_MS, nullptr);
 		UpdateEStopUi(hWnd, false);
 		UpdateTcpUiState(hWnd);
@@ -5838,6 +6048,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 
 		if (id == ID_BTN_ESTOP_TOGGLE) { DoToggleEStop(hWnd, false); return 0; }
+
+		if (id == ID_BTN_VELCONV_MAIN) { ShowVelConvWindow(hWnd); return 0; }
 
 		// 체크박스 9축
 		if (id >= ID_CHECK_AXIS(0) && id <= ID_CHECK_AXIS(kNumAxes - 3)) {

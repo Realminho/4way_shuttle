@@ -2733,7 +2733,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_DESTROY:
         KillTimer(hWnd, IDT_AX2_SENSOR_POLL);
         KillTimer(hWnd, IDT_GPIO_REFRESH);
-        PostQuitMessage(0);
+        //PostQuitMessage(0);
         return 0;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
