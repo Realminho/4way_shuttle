@@ -60,20 +60,29 @@ extern "C" int RunGPIOWindowExternal(HINSTANCE hInst);
 // 상태 관리 (기존 Demo 유지)
 // =======================================
 enum class TaskId : int {
-    GoWorkstation = 0,
-    GoConveyor,
-    LiftUp,
-    WorkDown,
-    ConveyorDown,
-    GripOpen,
-    GripClose,
-    GripServoOff,
-    DemoHomeWithBox,
-    DemoWorkWithBox,
-    DemoHomeWithoutBox,
-    DemoWorkWithoutBox,
+    GoLeft = 0,
+    GoWorkstation,
+    GoRight,
+
+    Forward,
+    Backward,
+
+    Forking,
+    Unforking,
+
+    Open,
+    Close,
+
+    Up,
+    Down,
+
+    HoistUp,
+    HoistDown,
+
+    All_Demo,
     DemoLoad,
     DemoUnload,
+
     COUNT
 };
 enum class TaskState : int { Idle = 0, Running, Done, Failed, Stopped };

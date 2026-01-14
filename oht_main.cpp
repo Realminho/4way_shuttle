@@ -62,7 +62,7 @@ extern "C" int RunGPIOWindowExternal(HINSTANCE hInst);
 // CHANGED: 아래 extern들은 democontrol 모듈의 함수를 창 없이도 호출하기 위해 필요
 static int g_gpioBank = -1;
 extern void ToggleDO_HW(int pin, bool turnOn, HWND hWnd);
-extern void DoGripServoOff_Compat(HWND hWnd);
+//extern void DoGripServoOff_Compat(HWND hWnd);
 extern bool EnumerateGPIO();
 extern bool PickBank_DI0_7_DO8_15();
 extern bool EnsureDO8to15AsOutput_BankFirst();
@@ -72,11 +72,11 @@ extern bool IsGripperOpenAndIdle();
 extern bool IsGripperClosed();
 extern bool IsGripperClosedAndIdle();
 extern bool g_diStable[8]; // DI0(Motioning), DI1(Catched) 등 디바운스 결과 사용
-extern void GO_Conveyor();     // Conveyor 버튼이 눌렸을 때 실행되는 함수
-extern void Go_Workstation();  // Workstation 버튼이 눌렸을 때 실행되는 함수
-extern void ConveyorDown();    // Conveyor Down 버튼
-extern void WorkDown();        // Work Down 버튼
-extern void DoUp();            // Up 버튼
+extern void GoLeft();     // Conveyor 버튼이 눌렸을 때 실행되는 함수
+extern void GoWorkstation();  // Workstation 버튼이 눌렸을 때 실행되는 함수
+extern void HoistDown();    // Conveyor Down 버튼
+extern void Down();        // Work Down 버튼
+extern void Up();            // Up 버튼
 extern void DoClose_Compat(HWND hWnd); // Close 버튼
 extern void DoOpen_Compat(HWND hWnd); // Open 버튼
 extern void DoStopAll(HWND hWnd); // Stop All 버튼
@@ -2044,8 +2044,8 @@ void TcpServerThreadProc()
 					case 1:
 						AppendLog(L"[ACT] Travel Pos1 -> Conveyor");
 						ToggleDO_HW(11, true, nullptr);
-						GO_Conveyor();
-						okTravel = WaitTaskFinished(TaskId::GoConveyor, 30000);
+						GoLeft();
+						okTravel = WaitTaskFinished(TaskId::GoLeft, 30000);
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos1 -> Conveyor DONE"
 							: L"[ACT] Travel Pos1 -> Conveyor FAILED or TIMEOUT");
@@ -2055,7 +2055,7 @@ void TcpServerThreadProc()
 					case 2:
 						AppendLog(L"[ACT] Travel Pos2 -> Workstation");
 						ToggleDO_HW(11, true, nullptr);
-						Go_Workstation();
+						GoWorkstation();
 						okTravel = WaitTaskFinished(TaskId::GoWorkstation, 30000);
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos2 -> Workstation DONE"
@@ -2116,8 +2116,8 @@ void TcpServerThreadProc()
 					case 1:
 						AppendLog(L"[ACT] Hoist Pos1 -> Conveyor Down");
 						ToggleDO_HW(11, true, nullptr);
-						ConveyorDown();
-						okHoist = WaitTaskFinished(TaskId::ConveyorDown, 20000);
+						HoistDown();
+						okHoist = WaitTaskFinished(TaskId::HoistDown, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos1 -> ConveyorDown DONE"
 							: L"[ACT] Hoist Pos1 -> ConveyorDown FAILED or TIMEOUT");
@@ -2128,8 +2128,8 @@ void TcpServerThreadProc()
 					case 2:
 						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
 						ToggleDO_HW(11, true, nullptr);
-						WorkDown();
-						okHoist = WaitTaskFinished(TaskId::WorkDown, 20000);
+						HoistDown();
+						okHoist = WaitTaskFinished(TaskId::HoistDown, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos2 -> WorkDown DONE"
 							: L"[ACT] Hoist Pos2 -> WorkDown FAILED or TIMEOUT");
@@ -2140,8 +2140,8 @@ void TcpServerThreadProc()
 					case 3:
 						AppendLog(L"[ACT] Hoist Pos3 -> Up Position");
 						ToggleDO_HW(11, true, nullptr);
-						DoUp();
-						okHoist = WaitTaskFinished(TaskId::LiftUp, 20000);
+						Up();
+						okHoist = WaitTaskFinished(TaskId::Up, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos3 -> Up DONE"
 							: L"[ACT] Hoist Pos3 -> Up FAILED or TIMEOUT");
@@ -2296,7 +2296,7 @@ void TcpServerThreadProc()
 						(void)WaitUntil(IsGripperClosedAndIdle, 5000);
 
 						// 2-2) Close 상태에서 Servo OFF
-						DoGripServoOff_Compat(g_hDemoWnd);
+						//DoGripServoOff_Compat(g_hDemoWnd);
 
 						// 2-3) 박스 보유 여부 체크
 						if (HasBox()) {
@@ -2308,7 +2308,7 @@ void TcpServerThreadProc()
 							AppendLog(L"[ACT] DriveReady: HasBox()==false -> Open then ServoOff");
 							DoOpen_Compat(g_hDemoWnd);
 							(void)WaitUntil(IsGripperOpenAndIdle, 5000);
-							DoGripServoOff_Compat(g_hDemoWnd);
+							//DoGripServoOff_Compat(g_hDemoWnd);
 						}
 					}
 					else {
@@ -2323,7 +2323,7 @@ void TcpServerThreadProc()
 
 					if (hcode != 0x03) {
 						AppendLog(L"[ACT] DriveReady: Hoist not UP(0x03) -> DoUp()");
-						DoUp();
+						Up();
 						(void)WaitUntil(IsAxis2Up, 20000);
 					}
 					else {
@@ -3752,7 +3752,7 @@ struct HybridBarcodeState
 
 	// ✅ "프로파일 정지" 파라미터(StopAxis 대신 사용)
 	double coarseBrakeVelPps = 800.0;     // 정지 명령 시 vel 상한(너무 작을 필요 없음)
-	double coarseBrakeAccMs = 50.0;
+	double coarseBrakeAccMs = 500.0;
 	double coarseBrakeDecMs = 500.0;      // 작을수록 더 급감속(충격↑), 크면 부드러움↑
 	double coarseStopVelThreshPps = 80.0; // 이 이하이면 '거의 0속도'로 판정
 

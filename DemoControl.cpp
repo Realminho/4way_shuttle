@@ -32,7 +32,7 @@ extern void StopAxis(int axis);
 
 // ========== EtherCAT 0x6063 읽기 ==========
 extern bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
-extern const int kAxisSlaveId[4] = { 0, 1, 2, 3 };
+extern const int kAxisSlaveId[12] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
 
 // 현재 위치(주행) 코드: Load=0x01, Unload=0x02, 그 외=0x00
 extern inline unsigned char CalcPosTravelCode();
@@ -52,38 +52,51 @@ extern inline bool IsAxis2LimitOn();
 // 상태 관리 (기존 Demo 유지)
 // =======================================
 enum class TaskId : int {
-    GoWorkstation = 0,
-    GoConveyor,
-    LiftUp,
-    WorkDown,
-    ConveyorDown,
-    GripOpen,
-    GripClose,
-    GripServoOff,
-    DemoHomeWithBox,
-    DemoWorkWithBox,
-    DemoHomeWithoutBox,
-    DemoWorkWithoutBox,
+    GoLeft = 0,
+    GoWorkstation,
+    GoRight,
+
+    Forward,
+    Backward,
+
+    Forking,
+    Unforking,
+
+    Open,
+    Close,
+
+    Up,
+    Down,
+
+    HoistUp,
+    HoistDown,
+
+    All_Demo,
     DemoLoad,
     DemoUnload,
+
     COUNT
 };
 enum class TaskState : int { Idle = 0, Running, Done, Failed, Stopped };
 
 const TCHAR* TaskName(TaskId id) {
     switch (id) {
-    case TaskId::GoWorkstation:      return TEXT("Workstation");
-    case TaskId::GoConveyor:         return TEXT("Conveyor");
-    case TaskId::LiftUp:             return TEXT("Lift Up");
-    case TaskId::WorkDown:           return TEXT("Work Down");
-    case TaskId::ConveyorDown:       return TEXT("Conveyor Down");
-    case TaskId::GripOpen:           return TEXT("Grip Open");
-    case TaskId::GripClose:          return TEXT("Grip Close");
-    case TaskId::GripServoOff:       return TEXT("Grip Servo OFF");
-    case TaskId::DemoHomeWithBox:    return TEXT("Demo Home(Box)");
-    case TaskId::DemoHomeWithoutBox: return TEXT("Demo Home(NoBox)");
-    case TaskId::DemoLoad:           return TEXT("Demo Load");
-    case TaskId::DemoUnload:         return TEXT("Demo Unload");
+    case TaskId::GoLeft:        return TEXT("GoLeft");
+    case TaskId::GoWorkstation: return TEXT("GoWorkstation");
+    case TaskId::GoRight:       return TEXT("GoRight");
+    case TaskId::Forward:       return TEXT("Forward");
+    case TaskId::Backward:      return TEXT("Backward");
+    case TaskId::Forking:       return TEXT("Forking");
+    case TaskId::Unforking:     return TEXT("Unforking");
+    case TaskId::Open:          return TEXT("Open");
+    case TaskId::Close:         return TEXT("Close");
+    case TaskId::Up:            return TEXT("Up");
+    case TaskId::Down:          return TEXT("Down");
+    case TaskId::HoistUp:       return TEXT("HoistUp");
+    case TaskId::HoistDown:     return TEXT("HoistDown");
+    case TaskId::All_Demo:      return TEXT("All_Demo");
+    case TaskId::DemoLoad:      return TEXT("DemoLoad");
+    case TaskId::DemoUnload:    return TEXT("DemoUnload");
     default: return TEXT("Unknown");
     }
 }
@@ -148,19 +161,30 @@ void ResetAllTaskStates() {
 // Barcode follower (기존 유지)
 // =======================================
 struct BarcodeParams {
-    int axis = 0;
-    long long targetBarcodeAbs;
-    double mainVel = 30000.0;
-    double mainAcc = 1000.0;
-    double mainDec = 1000.0;
-    double corrVel = 1000.0;
-    double corrAcc = 1000.0;
-    double corrDec = 1000.0;
+    // 주행부 축 (요구사항: 7번)
+    int axis = 7;
+
+    // 목표 바코드(0x6063, abs)
+    long long targetBarcodeAbs = 0;
+
+    // Main profile
+    double mainVel = 10000.0; // pps
+    double mainAcc = 1000.0;  // ms
+    double mainDec = 1000.0;  // ms
+
+    // Fine(Correction) profile
+    double corrVel = 1000.0;  // pps
+    double corrAcc = 300.0;   // ms
+    double corrDec = 300.0;   // ms
+
+    // (표시용/호환용) 기존 deadband 필드 유지 (main 알고리즘은 arriveCnt=±2cnt 사용)
     int deadband = 2;
-    double gear = 4.3;
-    double wheelDia = 70.0;
-    double motorCpr = 10000.0;
-    double bcMmPerCnt = 0.1;
+
+    // Conversion
+    double gear = 4.4248;
+    double wheelDia = 115.0;    // mm
+    double motorCpr = 10000.0;  // pulses per motor rev
+    double bcMmPerCnt = 1.07;   // mm per barcode count
 };
 class BarcodeFollower {
 public:
@@ -174,135 +198,444 @@ public:
     }
     void Stop() {
         running_ = false;
-        if (params_.axis >= 0 && params_.axis < 4) {
+        if (params_.axis >= 0 && params_.axis < 9) {
             StopAxis(params_.axis);
         }
     }
     bool IsRunning() const { return running_.load(); }
+
 private:
+    // ===== main의 Hybrid Barcode state를 Demo-thread 형태로 이식 =====
+    static constexpr int  kMaxAxes_ = 12;
+    static constexpr int  kBarcodeAxis_ = 9;     // ✅ 바코드 0x6063 읽는 축
+    static constexpr DWORD POLL_MS_ = 30;
+    static constexpr double dtSec_ = 0.03;
+
     std::atomic<bool> running_{ false };
     BarcodeParams params_{};
     TaskId reportTask_ = TaskId::GoWorkstation;
 
-    bool inCorr_ = false;
-    bool finalSnapSent_ = false;
-    bool stopDelayActive_ = false;
-    int  stopDelayTimer_ = 0;
+    struct HbcSnapshot { double gear, wheelDia, motorCpr, bcMmPerCnt; };
 
-    static constexpr DWORD POLL_MS = 30;
-    static constexpr long long kFinalCheckErr = 2;
+    static inline int sgnll(long long v) { return (v > 0) - (v < 0); }
 
-    int ComputeAutoStartErr(double mainVel) { return (int)std::llround(mainVel * 0.01); }
-    bool Read6063Now(int axis, int& out) {
-        if (axis < 0 || axis >= 4) return false;
-        return ReadAxis_TxPDO_6063(kAxisSlaveId[axis], out);
-    }
-
-    struct HbcSnapshot { double gear; double wheelDia; double motorCpr; double bcMmPerCnt; };
-    static inline double HBC_pulsesPerMm(const HbcSnapshot& s) {
+    // ✅ main 코드의 (주의: gear 반영 방식은 원본 그대로)
+    static inline double pulsesPerMm(const HbcSnapshot& s) {
+        // NOTE: main 파일의 구현을 그대로 가져옴(요청사항: 알고리즘 그대로)
+        // pulses per wheel rev = motorCpr * gear 라는 주석은 있으나,
+        // 실제 식은 motorCpr / (pi * wheelDia) 로 되어 있음.
         return s.motorCpr / (3.14159265358979323846 * s.wheelDia);
     }
-    static inline double HBC_bcToMm(const HbcSnapshot& s, long long bc) {
-        return bc * s.bcMmPerCnt;
-    }
-    static inline long long HBC_mmToPulses(const HbcSnapshot& s, double mm) {
-        double pulses = mm * HBC_pulsesPerMm(s);
+    static inline double bcToMm(const HbcSnapshot& s, long long bc) { return (double)bc * s.bcMmPerCnt; }
+    static inline long long mmToPulses(const HbcSnapshot& s, double mm) {
+        double pulses = mm * pulsesPerMm(s);
         return (long long)std::llround(pulses);
     }
-    static inline long long HBC_bcToPulses(const HbcSnapshot& s, long long bc) {
-        return HBC_mmToPulses(s, HBC_bcToMm(s, bc));
+    static inline long long bcToPulses(const HbcSnapshot& s, long long bc) {
+        return mmToPulses(s, bcToMm(s, bc));
     }
-    void IssueAbsWithProfile(int axis, long long absTarget, double vpps, double a_ms, double d_ms) {
-        StartAbsMoveWithProfile(axis, absTarget, vpps, a_ms, d_ms);
+
+    // motor rpm -> pps (main과 동일)
+    static inline double RpmToPps(double motorRpm, double motorCpr) {
+        return std::fabs(motorRpm) * motorCpr / 60.0;
     }
-    void ThreadProc() {
-        const int ax = params_.axis;
-        if (!g_commStarted || ax < 0 || ax >= 4) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
-        if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
-        SetTaskState(reportTask_, TaskState::Running);
 
-        inCorr_ = false; finalSnapSent_ = false; stopDelayActive_ = false; stopDelayTimer_ = 0;
+    static inline double DecelPps2_Model(double profileVelPps, double decMs, double safetyFactor) {
+        double t = std::max(1.0, decMs) / 1000.0;
+        double a = profileVelPps / t;
+        safetyFactor = std::clamp(safetyFactor, 0.05, 1.0);
+        a *= safetyFactor;
+        return std::max(1.0, a);
+    }
+    static inline double StopDistPulses(double vPps, double aDecPps2) {
+        return (vPps * vPps) / (2.0 * std::max(1.0, aDecPps2));
+    }
+    static inline double VelLimitFromDist(double distPulses, double aDecPps2) {
+        if (distPulses <= 0) return 0.0;
+        return std::sqrt(2.0 * std::max(1.0, aDecPps2) * distPulses);
+    }
 
-        int now6063 = 0;
-        if (!Read6063Now(ax, now6063)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
+    bool Read6063Now(int& out) {
+        if (kBarcodeAxis_ < 0 || kBarcodeAxis_ >= kMaxAxes_) return false;
+        return ReadAxis_TxPDO_6063(kAxisSlaveId[kBarcodeAxis_], out);
+    }
 
-        const long long targetBarcodeAbs = params_.targetBarcodeAbs;
-        HbcSnapshot snap{ params_.gear, params_.wheelDia, params_.motorCpr, params_.bcMmPerCnt };
-        long long bcErr0 = targetBarcodeAbs - (long long)now6063;
-        long long targetMotorPulse = HBC_bcToPulses(snap, bcErr0);
-
+    // ✅ StopAxis 대신: "현재 위치로 AbsMove" → 프로파일 감속으로 0속도 유도
+    void ProfileStop(int ax, double vel_pps, double acc_ms, double dec_ms) {
         CoreMotionStatus st{};
         g_cm.GetStatus(&st);
         long long curPos = (long long)st.axesStatus[ax].actualPos;
-        long long firstTarget = curPos + targetMotorPulse;
-        IssueAbsWithProfile(ax, firstTarget, params_.mainVel, params_.mainAcc, params_.mainDec);
 
-        int startBcErr = ComputeAutoStartErr(params_.mainVel);
-        const int deadband = params_.deadband;
+        vel_pps = std::max(50.0, vel_pps);
+        acc_ms = std::max(1.0, acc_ms);
+        dec_ms = std::max(1.0, dec_ms);
+
+        StartAbsMoveWithProfile(ax, curPos, vel_pps, acc_ms, dec_ms);
+
+        lastCmdVel_ = vel_pps;
+        lastCmdTarget_ = curPos;
+        lastCmdTick_ = GetTickCount64();
+    }
+
+    void SendMoveThrottled(
+        int ax,
+        long long absTarget,
+        double vel_pps,
+        double acc_ms,
+        double dec_ms,
+        double velChangeRatio,
+        long long minTargetDeltaPulses,
+        DWORD  minPeriodMs
+    ) {
+        if (!running_) return;
+
+        ULONGLONG now = GetTickCount64();
+        if (now < stopCooldownUntil_) return;
+        if (now < fineStartCooldownUntil_) return;
+
+        bool periodOk = (now - lastCmdTick_) >= (ULONGLONG)minPeriodMs;
+
+        double lastV = lastCmdVel_;
+        bool velChanged = (lastV <= 1.0) ? true : ((std::fabs(vel_pps - lastV) / lastV) >= velChangeRatio);
+
+        long long lastT = lastCmdTarget_;
+        bool targetChanged = (std::llabs(absTarget - lastT) >= std::max(1LL, minTargetDeltaPulses));
+
+        if (periodOk && (velChanged || targetChanged)) {
+            StartAbsMoveWithProfile(ax, absTarget, vel_pps, acc_ms, dec_ms);
+            lastCmdVel_ = vel_pps;
+            lastCmdTarget_ = absTarget;
+            lastCmdTick_ = now;
+        }
+    }
+
+    // ---- runtime state (main과 동일한 개념 유지) ----
+    enum Phase { IDLE = 0, COARSE = 1, COARSE_BRAKE = 2, FINE = 3, DONE = 4 };
+    Phase phase_ = IDLE;
+
+    long long targetBarcodeAbs_ = 0;
+    long long coarseTargetBarcodeAbs_ = 0;
+
+    // coarse → 목표-10cnt
+    int preStopCnt_ = 10;
+    int coarseArriveCnt_ = 1;
+    int coarseStableTicksNeed_ = 5;
+    int coarseStableTicks_ = 0;
+
+    // profile stop 파라미터(StopAxis 대신)
+    double coarseBrakeVelPps_ = 800.0;
+    double coarseBrakeAccMs_ = 500.0;
+    double coarseBrakeDecMs_ = 500.0;
+    double coarseStopVelThreshPps_ = 80.0;
+
+    // fine → ±2cnt 안정화
+    int arriveCnt_ = 2;
+    int arriveStableTicksNeed_ = 10;
+    int arriveStableTicks_ = 0;
+
+    // overshoot
+    int lastErrSign_ = 0;
+    int signFlipTicks_ = 0;
+    bool forbidReverse_ = true;
+
+    // throttle tracking
+    double lastCmdVel_ = 0.0;
+    long long lastCmdTarget_ = 0;
+    ULONGLONG lastCmdTick_ = 0;
+
+    // creep/fine limit
+    int creepCnt_ = 50;
+    double creepVel_ = 200.0;
+    int fineStepCntMax_ = 1;
+
+    // decel estimator
+    double vPrevPps_ = 0.0;
+    double aDecEma_ = 0.0;
+    bool havePrevV_ = false;
+
+    // cooldown
+    ULONGLONG stopCooldownUntil_ = 0;
+    ULONGLONG fineStartCooldownUntil_ = 0;
+
+    void ThreadProc() {
+        const int ax = params_.axis;
+
+        if (!g_commStarted || ax < 0 || ax >= kMaxAxes_) {
+            SetTaskState(reportTask_, TaskState::Failed);
+            running_ = false;
+            return;
+        }
+        if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) {
+            SetTaskState(reportTask_, TaskState::Failed);
+            running_ = false;
+            return;
+        }
+
+        // reset
+        phase_ = IDLE;
+        arriveStableTicks_ = 0;
+        coarseStableTicks_ = 0;
+        lastErrSign_ = 0;
+        signFlipTicks_ = 0;
+        stopCooldownUntil_ = 0;
+        fineStartCooldownUntil_ = 0;
+        havePrevV_ = false;
+        vPrevPps_ = 0.0;
+        aDecEma_ = 0.0;
+
+        SetTaskState(reportTask_, TaskState::Running);
+
+        int now6063 = 0;
+        if (!Read6063Now(now6063)) {
+            SetTaskState(reportTask_, TaskState::Failed);
+            running_ = false;
+            return;
+        }
+
+        targetBarcodeAbs_ = params_.targetBarcodeAbs;
+
+        long long finalErr = targetBarcodeAbs_ - (long long)now6063;
+        int dir = sgnll(finalErr);
+        if (dir == 0) {
+            phase_ = FINE;
+            lastErrSign_ = 0;
+        }
+        else {
+            coarseTargetBarcodeAbs_ = targetBarcodeAbs_ - (long long)dir * (long long)preStopCnt_;
+            lastErrSign_ = dir;
+
+            // initial move to coarse target
+            CoreMotionStatus st{};
+            g_cm.GetStatus(&st);
+            long long curPos = (long long)st.axesStatus[ax].actualPos;
+
+            HbcSnapshot snap{ params_.gear, params_.wheelDia, params_.motorCpr, params_.bcMmPerCnt };
+            long long coarseRel = (long long)coarseTargetBarcodeAbs_ - (long long)now6063;
+            long long coarsePulses = bcToPulses(snap, coarseRel);
+            long long absTarget = curPos + coarsePulses;
+
+            StartAbsMoveWithProfile(ax, absTarget, params_.mainVel, params_.mainAcc, params_.mainDec);
+            lastCmdVel_ = params_.mainVel;
+            lastCmdTarget_ = absTarget;
+            lastCmdTick_ = GetTickCount64();
+
+            phase_ = COARSE;
+        }
+
+        const int overshootConfirmTicks = 3;
+        HbcSnapshot snap{ params_.gear, params_.wheelDia, params_.motorCpr, params_.bcMmPerCnt };
+        long long pulsesPerCnt = std::llabs(bcToPulses(snap, 1));
+        if (pulsesPerCnt < 1) pulsesPerCnt = 1;
+
         bool completed = false;
 
         while (running_.load()) {
-            if (!Read6063Now(ax, now6063)) { completed = false; break; }
-            long long bcErr = targetBarcodeAbs - (long long)now6063;
-            long long eAbs = llabs(bcErr);
-            // === deadband 누적 체류 시간 로직 ===
-            const int deadband = params_.deadband;
-            bool inDeadband = (eAbs <= deadband);
+            if (!Read6063Now(now6063)) { completed = false; break; }
 
-            if (inDeadband) {
-                // deadband 처음 진입한 순간에만 타이머 초기화
-                if (!stopDelayActive_) {
-                    stopDelayActive_ = true;
+            // phase에 따라 활성 목표(6063 abs)
+            long long activeTargetAbs =
+                (phase_ == COARSE || phase_ == COARSE_BRAKE) ? coarseTargetBarcodeAbs_ : targetBarcodeAbs_;
 
-                    // 새 시퀀스 시작할 때 ThreadProc 앞에서 stopDelayTimer_ = 0 이므로
-                    // 처음 진입 시에만 70으로 세팅됨
-                    if (stopDelayTimer_ == 0) {
-                        stopDelayTimer_ = 70;   // 약 2.1초 (누적)
-                    }
+            long long bcErr = activeTargetAbs - (long long)now6063;
+            long long bcErrAbs = llabs(bcErr);
+
+            // status (속도/위치)
+            CoreMotionStatus st{};
+            g_cm.GetStatus(&st);
+
+            double motorRpm = (double)st.axesStatus[ax].actualVelocity;
+            double vCurPps = RpmToPps(motorRpm, params_.motorCpr);
+
+            // measured decel EMA
+            if (!havePrevV_) {
+                havePrevV_ = true;
+                vPrevPps_ = vCurPps;
+            }
+            else {
+                double dv = vPrevPps_ - vCurPps; // + when decelerating
+                double aInst = dv / dtSec_;
+                vPrevPps_ = vCurPps;
+
+                if (aInst > 50.0) {
+                    const double alpha = 0.15;
+                    if (aDecEma_ <= 0.0) aDecEma_ = aInst;
+                    else aDecEma_ = (1.0 - alpha) * aDecEma_ + alpha * aInst;
                 }
+            }
 
-                // deadband 안에 있는 동안에만 타이머 감소
-                if (stopDelayActive_) {
-                    if (--stopDelayTimer_ <= 0) {
-                        completed = true;
-                        break;
-                    }
+            // overshoot detect
+            int sgn = sgnll(bcErr);
+            if (forbidReverse_) {
+                if (lastErrSign_ != 0 && sgn != 0 && sgn != lastErrSign_) signFlipTicks_++;
+                else signFlipTicks_ = 0;
+
+                if (signFlipTicks_ >= overshootConfirmTicks) {
+                    StopAxis(ax);
+                    completed = false;
+                    break;
                 }
             }
             else {
-                // deadband 밖: 타이머 “멈춤” (값 유지, 감소 X)
-                // stopDelayActive_는 true 상태로 둬도 되고,
-                // 필요하다면 flag를 분리해도 됨.
-                // 여기서는 아무것도 안 건드려서 단순히 pause 효과.
+                signFlipTicks_ = 0;
+            }
+            if (sgn != 0) lastErrSign_ = sgn;
+
+            // ==========================
+            // PHASE: COARSE_BRAKE
+            // ==========================
+            if (phase_ == COARSE_BRAKE) {
+                if (vCurPps <= coarseStopVelThreshPps_) {
+                    phase_ = FINE;
+                    arriveStableTicks_ = 0;
+
+                    long long fe = targetBarcodeAbs_ - (long long)now6063;
+                    lastErrSign_ = sgnll(fe);
+                    signFlipTicks_ = 0;
+
+                    fineStartCooldownUntil_ = GetTickCount64() + 120;
+
+                    // command 갱신 유도
+                    lastCmdVel_ = 0;
+                    lastCmdTarget_ = 0;
+                }
+                ::Sleep(POLL_MS_);
+                continue;
             }
 
-            if (!inCorr_ && eAbs <= startBcErr) inCorr_ = true;
+            // ==========================
+            // PHASE: COARSE
+            // ==========================
+            if (phase_ == COARSE) {
+                if (bcErrAbs <= coarseArriveCnt_) {
+                    if (++coarseStableTicks_ >= coarseStableTicksNeed_) {
+                        ProfileStop(ax, coarseBrakeVelPps_, coarseBrakeAccMs_, coarseBrakeDecMs_);
 
-            if (inCorr_) {
-                g_cm.GetStatus(&st);
-                long long cur = (long long)st.axesStatus[ax].actualPos;
-                double actVel = std::fabs(st.axesStatus[ax].actualVelocity);
-                if (!finalSnapSent_) {
-                    long long remainingPulses = HBC_bcToPulses(snap, bcErr);
-                    long long absTarget = cur + remainingPulses;
-                    IssueAbsWithProfile(ax, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
-                    finalSnapSent_ = true;
-                }
-                else {
-                    if (actVel < 1.0 && eAbs > kFinalCheckErr) {
-                        long long remainingPulses = HBC_bcToPulses(snap, bcErr);
-                        long long absTarget = cur + remainingPulses;
-                        IssueAbsWithProfile(ax, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
+                        stopCooldownUntil_ = GetTickCount64() + 120;
+                        fineStartCooldownUntil_ = stopCooldownUntil_;
+
+                        coarseStableTicks_ = 0;
+                        phase_ = COARSE_BRAKE;
                     }
+                    ::Sleep(POLL_MS_);
+                    continue;
                 }
-            }
-            ::Sleep(30);
-        }
-        if (!running_.load()) SetTaskState(reportTask_, TaskState::Stopped);
-        else SetTaskState(reportTask_, completed ? TaskState::Done : TaskState::Failed);
+                coarseStableTicks_ = 0;
 
-        running_ = false; inCorr_ = false; finalSnapSent_ = false; stopDelayActive_ = false; stopDelayTimer_ = 0;
+                long long remainingPulses = bcToPulses(snap, bcErr);
+                long long distAbs = llabs(remainingPulses);
+
+                auto safe_sqrt_scale = [](double base, double refVel, double vel, double lo, double hi) {
+                    double v = std::max(1.0, vel);
+                    double scale = std::sqrt(std::max(0.2, refVel / v));
+                    return std::clamp(base * scale, lo, hi);
+                    };
+
+                double mainDecSafety = safe_sqrt_scale(0.28, 5000.0, params_.mainVel, 0.15, 0.35);
+                double aMainModel = DecelPps2_Model(params_.mainVel, params_.mainDec, mainDecSafety);
+
+                double aMeas = (aDecEma_ > 0.0) ? aDecEma_ : 0.0;
+                double aMainDec = (aMeas > 0.0) ? std::min(aMeas, aMainModel * 1.2) : aMainModel;
+
+                double stopDistNow = StopDistPulses(vCurPps, aMainDec);
+
+                long long marginPulses =
+                    (long long)(pulsesPerCnt * 6) +        // coarse는 6cnt
+                    (long long)(vCurPps * 0.15) +          // 150ms 선행
+                    (long long)(stopDistNow * 0.10) +      // 10% 버퍼
+                    300;
+
+                if (marginPulses < pulsesPerCnt * 6) marginPulses = pulsesPerCnt * 6;
+
+                double distForPlan = (double)distAbs - (double)marginPulses;
+                if (distForPlan < 0) distForPlan = 0;
+
+                double vEnvMain = std::min(params_.mainVel, VelLimitFromDist(distForPlan, aMainDec));
+
+                if (bcErrAbs <= (preStopCnt_ + 10))
+                    vEnvMain = std::min(vEnvMain, std::max(200.0, creepVel_));
+
+                if (vEnvMain < 50.0 && distAbs > 0) vEnvMain = 50.0;
+
+                long long curPos = (long long)st.axesStatus[ax].actualPos;
+                long long absTarget = curPos + remainingPulses;
+
+                DWORD period = (bcErrAbs <= 80) ? 40 : 90;
+                double ratio = (bcErrAbs <= 80) ? 0.05 : 0.12;
+
+                SendMoveThrottled(ax, absTarget, vEnvMain, params_.mainAcc, params_.mainDec,
+                    ratio, pulsesPerCnt, period);
+
+                ::Sleep(POLL_MS_);
+                continue;
+            }
+
+            // ==========================
+            // PHASE: FINE
+            // ==========================
+            if (phase_ == FINE) {
+                long long finalErr2 = targetBarcodeAbs_ - (long long)now6063;
+                long long finalErrAbs = llabs(finalErr2);
+
+                if (finalErrAbs <= arriveCnt_) {
+                    if (++arriveStableTicks_ >= arriveStableTicksNeed_) {
+                        StopAxis(ax);
+                        completed = true;
+                        break;
+                    }
+                    ::Sleep(POLL_MS_);
+                    continue;
+                }
+                arriveStableTicks_ = 0;
+
+                long long remainingPulses = bcToPulses(snap, finalErr2);
+
+                long long stepMaxPulses = llabs(bcToPulses(snap, (long long)fineStepCntMax_));
+                if (stepMaxPulses < 1) stepMaxPulses = 1;
+
+                long long stepPulses = remainingPulses;
+                if (stepPulses > stepMaxPulses) stepPulses = stepMaxPulses;
+                if (stepPulses < -stepMaxPulses) stepPulses = -stepMaxPulses;
+
+                if (finalErrAbs <= 10) {
+                    long long oneCntPulse = llabs(bcToPulses(snap, 1));
+                    stepPulses = std::clamp(stepPulses, -std::max(1LL, oneCntPulse), std::max(1LL, oneCntPulse));
+                }
+
+                double vPlan = std::min(params_.corrVel, creepVel_);
+                if (finalErrAbs <= creepCnt_)
+                    vPlan = std::min(vPlan, creepVel_);
+
+                if (finalErrAbs <= 6) vPlan = std::min(vPlan, 200.0);
+                if (vPlan < 20.0) vPlan = 20.0;
+
+                long long curPos = (long long)st.axesStatus[ax].actualPos;
+                long long absTarget = curPos + stepPulses;
+
+                SendMoveThrottled(ax, absTarget, vPlan, params_.corrAcc, params_.corrDec,
+                    0.01, 1, 80);
+
+                ::Sleep(POLL_MS_);
+                continue;
+            }
+
+            // IDLE/DONE
+            ::Sleep(POLL_MS_);
+        }
+
+        if (!running_.load())
+            SetTaskState(reportTask_, TaskState::Stopped);
+        else
+            SetTaskState(reportTask_, completed ? TaskState::Done : TaskState::Failed);
+
+        running_ = false;
+        phase_ = IDLE;
+        arriveStableTicks_ = 0;
+        coarseStableTicks_ = 0;
+        signFlipTicks_ = 0;
+        stopCooldownUntil_ = GetTickCount64() + 300;
+        fineStartCooldownUntil_ = stopCooldownUntil_;
     }
+
     std::thread worker_;
 };
 static BarcodeFollower g_bcRunner;
@@ -339,64 +672,20 @@ static void StartMoveAndMonitor(const MoveMonitorArgs& m, double vpps, double ac
         CoreMotionStatus st{};
         TaskState result = TaskState::Failed;
 
-        bool   started = false;  // ★ 실제로 “가동을 시작했는지”
-        double initialPos = 0.0;
-        bool   haveInitPos = false;
-
-        // “움직였다고 인정할” 기준값들
-        const double kStartVelThreshold = m.velEps * 2.0; // 이 속도 이상 나와야 시작으로 인정
-        const double kStartMoveThreshold = m.posEps;       // 위치 변화도 기준 (필요시 더 작게)
-
-        while (true) {
-            // 타임아웃
-            if (GetTickCount() - start > m.timeoutMs) {
-                result = TaskState::Failed;
-                break;
-            }
-
+        while (GetTickCount() - start < m.timeoutMs) {
             g_cm.GetStatus(&st);
-            auto& ax = st.axesStatus[m.axis];
-            double v = std::fabs(ax.actualVelocity);
-            double pos = (double)ax.actualPos;
-
-            if (!haveInitPos) {
-                initialPos = pos;
-                haveInitPos = true;
-            }
-
-            double moved = std::fabs(pos - initialPos);
-            double e = std::fabs(pos - (double)m.target);
-
-            // ★ 아직 “시작했다고 인정” 안 된 상태라면,
-            //   충분히 움직이거나 속도가 컸던 적이 있는지 먼저 체크
-            if (!started) {
-                if (v > kStartVelThreshold || moved > kStartMoveThreshold) {
-                    started = true;   // 이제부터는 v<velEps를 “멈춤”으로 인정
-                }
-                // 시작 전에는 v가 0이어도 그냥 계속 기다림
-                ::Sleep(30);
-                continue;
-            }
-
-            // ★ 여기부터는 “한번은 제대로 움직인 후” 라고 가정
-            if (v < m.velEps) {
-                if (e <= m.posEps) {
-                    // 목표 위치 근처에서 멈춤 → 정상 완료
-                    result = TaskState::Done;
-                }
-                else {
-                    // 목표에서 멀리 멈춤 (리밋 등)
-                    // 이 모션이 그걸 성공으로 인정하는지 여부에 따라
-                    result = m.treatStoppedAsDone
-                        ? TaskState::Done
-                        : TaskState::Stopped;
-                }
+            long long posErr = (long long)st.axesStatus[m.axis].actualPos - m.target;
+            double v = std::fabs(st.axesStatus[m.axis].actualVelocity);
+            if (std::llabs(posErr) <= (long long)m.posEps && v <= m.velEps) {
+                result = TaskState::Done;
                 break;
             }
-
+            if (m.treatStoppedAsDone && v <= m.velEps) {
+                result = TaskState::Done;
+                break;
+            }
             ::Sleep(30);
         }
-
         SetTaskState(m.task, result);
         }).detach();
 }
@@ -416,7 +705,7 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
         SetTaskState(task, TaskState::Failed);
         return;
     }
-    if (axis < 0 || axis >= 4) {
+    if (axis < 0 || axis >= 9) {
         SetTaskState(task, TaskState::Failed);
         return;
     }
@@ -1007,81 +1296,81 @@ static void UpdateDIText(int i, bool supported, bool level, HWND hWnd) {
 
 static bool s_servoOffHandledOnce = false;
 
-static void RefreshInputsWithDebounce(HWND hWnd) {
-    uint32_t diNow = 0;
-    if (!SampleDI_Once(diNow)) return;
-    for (int i = 0; i < 8; ++i) g_diSamples[i][g_diSamplePos] = (diNow >> i) & 1u;
-    g_diSamplePos = (g_diSamplePos + 1) % kDI_BufferDepth;
-    for (int i = 0; i < 8; ++i) {
-        bool newStable = MajorityOfSamples(i);
-        g_diStable[i] = newStable;
-        g_cachedLevels[i] = newStable;
-    }
-    ApplyDIOverlayRules();
-    for (int i = 0; i < 8; ++i) {
-        bool sup = (g_gpioInfo[g_gpioBank].supInput & (1u << i)) != 0;
-        UpdateDIText(i, sup, g_diStable[i], hWnd);
-    }
-    // ============================================
-    // ★ Motioning(DI0) ON → OFF 전이 감지
-    //    → GripOpen / GripClose 를 Done 으로 전환
-    // ============================================
-    {
-        static bool s_prevMotioning = false;
-        static bool s_init = false;
-
-        // DI0 = Motioning (input 1번 신호)
-        bool curMotioning = g_diStable[0];
-
-        if (!s_init) {
-            // 첫 호출 시에는 기준값만 세팅하고 끝
-            s_prevMotioning = curMotioning;
-            s_init = true;
-        }
-        else {
-            // 이전에 ON이었다가 지금 OFF로 떨어진 순간만 감지
-            if (s_prevMotioning && !curMotioning) {
-                // GripOpen 이 진행중이면 완료로
-                TaskState openState = g_taskStatus[(int)TaskId::GripOpen].state.load();
-                if (openState == TaskState::Running) {
-                    SetTaskState(TaskId::GripOpen, TaskState::Done);
-                }
-
-                // GripClose 도 진행중이면 완료로
-                TaskState closeState = g_taskStatus[(int)TaskId::GripClose].state.load();
-                if (closeState == TaskState::Running) {
-                    SetTaskState(TaskId::GripClose, TaskState::Done);
-                }
-            }
-            // ★ 추가: 프로그램 전체에서 딱 1번만 GripServoOff 상태를 보고
-            //         GripOpen / GripClose 를 Done 으로 맞춰준다.
-            if (!s_servoOffHandledOnce) {
-                TaskState servoOffState =
-                    g_taskStatus[(int)TaskId::GripServoOff].state.load();
-                if (servoOffState == TaskState::Done) {
-
-                    TaskState openState =
-                        g_taskStatus[(int)TaskId::GripOpen].state.load();
-                    if (openState == TaskState::Running) {
-                        SetTaskState(TaskId::GripOpen, TaskState::Done);
-                    }
-
-                    TaskState closeState =
-                        g_taskStatus[(int)TaskId::GripClose].state.load();
-                    if (closeState == TaskState::Running) {
-                        SetTaskState(TaskId::GripClose, TaskState::Done);
-                    }
-
-                    // ★ 한 번 처리했으니 다시는 안 하도록 플래그 ON
-                    s_servoOffHandledOnce = true;
-                }
-            }
-
-            // 이전 Motioning 상태 업데이트
-            s_prevMotioning = curMotioning;
-        }
-    }
-}
+//static void RefreshInputsWithDebounce(HWND hWnd) {
+//    uint32_t diNow = 0;
+//    if (!SampleDI_Once(diNow)) return;
+//    for (int i = 0; i < 8; ++i) g_diSamples[i][g_diSamplePos] = (diNow >> i) & 1u;
+//    g_diSamplePos = (g_diSamplePos + 1) % kDI_BufferDepth;
+//    for (int i = 0; i < 8; ++i) {
+//        bool newStable = MajorityOfSamples(i);
+//        g_diStable[i] = newStable;
+//        g_cachedLevels[i] = newStable;
+//    }
+//    ApplyDIOverlayRules();
+//    for (int i = 0; i < 8; ++i) {
+//        bool sup = (g_gpioInfo[g_gpioBank].supInput & (1u << i)) != 0;
+//        UpdateDIText(i, sup, g_diStable[i], hWnd);
+//    }
+//    // ============================================
+//    // ★ Motioning(DI0) ON → OFF 전이 감지
+//    //    → GripOpen / GripClose 를 Done 으로 전환
+//    // ============================================
+//    {
+//        static bool s_prevMotioning = false;
+//        static bool s_init = false;
+//
+//        // DI0 = Motioning (input 1번 신호)
+//        bool curMotioning = g_diStable[0];
+//
+//        if (!s_init) {
+//            // 첫 호출 시에는 기준값만 세팅하고 끝
+//            s_prevMotioning = curMotioning;
+//            s_init = true;
+//        }
+//        else {
+//            // 이전에 ON이었다가 지금 OFF로 떨어진 순간만 감지
+//            if (s_prevMotioning && !curMotioning) {
+//                // GripOpen 이 진행중이면 완료로
+//                TaskState openState = g_taskStatus[(int)TaskId::GripOpen].state.load();
+//                if (openState == TaskState::Running) {
+//                    SetTaskState(TaskId::GripOpen, TaskState::Done);
+//                }
+//
+//                // GripClose 도 진행중이면 완료로
+//                TaskState closeState = g_taskStatus[(int)TaskId::GripClose].state.load();
+//                if (closeState == TaskState::Running) {
+//                    SetTaskState(TaskId::GripClose, TaskState::Done);
+//                }
+//            }
+//            // ★ 추가: 프로그램 전체에서 딱 1번만 GripServoOff 상태를 보고
+//            //         GripOpen / GripClose 를 Done 으로 맞춰준다.
+//            if (!s_servoOffHandledOnce) {
+//                TaskState servoOffState =
+//                    g_taskStatus[(int)TaskId::GripServoOff].state.load();
+//                if (servoOffState == TaskState::Done) {
+//
+//                    TaskState openState =
+//                        g_taskStatus[(int)TaskId::GripOpen].state.load();
+//                    if (openState == TaskState::Running) {
+//                        SetTaskState(TaskId::GripOpen, TaskState::Done);
+//                    }
+//
+//                    TaskState closeState =
+//                        g_taskStatus[(int)TaskId::GripClose].state.load();
+//                    if (closeState == TaskState::Running) {
+//                        SetTaskState(TaskId::GripClose, TaskState::Done);
+//                    }
+//
+//                    // ★ 한 번 처리했으니 다시는 안 하도록 플래그 ON
+//                    s_servoOffHandledOnce = true;
+//                }
+//            }
+//
+//            // 이전 Motioning 상태 업데이트
+//            s_prevMotioning = curMotioning;
+//        }
+//    }
+//}
 static bool ReadDO16Bits(uint32_t& dirOut, uint32_t& lvlOut) {
     dirOut = 0; lvlOut = 0;
     if (g_gpioBank < 0) return false;
@@ -1118,7 +1407,7 @@ static void RefreshOutputs(HWND hWnd) {
 }
 void RefreshLevels(HWND hWnd) {
     if (g_gpioBank < 0) return;
-    RefreshInputsWithDebounce(hWnd);
+    //RefreshInputsWithDebounce(hWnd);
     RefreshOutputs(hWnd);
 }
 
@@ -1282,18 +1571,18 @@ void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
     else if (!turnOn) { g_outputPendingOff[pin] = false; }
 
     // 출력 후 곧바로 입력 갱신
-    RefreshInputsWithDebounce(hWnd);
+    //RefreshInputsWithDebounce(hWnd);
 }
 
 // 축0 바코드가 Conveyor 위치에 있는지 확인 (0x6063 값 기준)
-bool IsAxis0AtConveyorBarcode()
+bool IsAxisLeft()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 476774;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 509;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
-    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[0], nowBc))
+    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[9], nowBc))
         return false;
 
     long long diff = (long long)nowBc - targetBc;
@@ -1301,39 +1590,65 @@ bool IsAxis0AtConveyorBarcode()
 }
 
 // 축0 바코드가 Workstation 위치에 있는지 확인 (0x6063 값 기준)
-bool IsAxis0AtWorkstationBarcode()
+bool IsAxisRight()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 491332;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 2475;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
-    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[0], nowBc))
+    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[9], nowBc))
         return false;
 
     long long diff = (long long)nowBc - targetBc;
     return std::llabs(diff) <= bcEps;
 }
 
-bool IsAxis0AtConveyorBarcodeStopped()
+// 축0 바코드가 Workstation 위치에 있는지 확인 (0x6063 값 기준)
+bool IsAxisWorkstation()
 {
-    if (!IsAxis0AtConveyorBarcode())
+    // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
+    const long long targetBc = 1400;   // GO_Conveyor 의 targetBarcodeAbs
+    const int bcEps = 5;                 // 허용 오차 (필요시 조정)
+
+    int nowBc = 0;
+    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[9], nowBc))
+        return false;
+
+    long long diff = (long long)nowBc - targetBc;
+    return std::llabs(diff) <= bcEps;
+}
+
+bool IsAxisLeftStopped()
+{
+    if (!IsAxisLeft())
         return false;
 
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    double v = std::fabs(st.axesStatus[0].actualVelocity);
+    double v = std::fabs(st.axesStatus[7].actualVelocity);
     return v <= 1.0;    // 적당한 정지 기준
 }
 
-bool IsAxis0AtWorkstationBarcodeStopped()
+bool IsAxisRightStopped()
 {
-    if (!IsAxis0AtWorkstationBarcode())
+    if (!IsAxisRight())
         return false;
 
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    double v = std::fabs(st.axesStatus[0].actualVelocity);
+    double v = std::fabs(st.axesStatus[7].actualVelocity);
+    return v <= 1.0;
+}
+
+bool IsAxisWorkstationStopped()
+{
+    if (!IsAxisWorkstation())
+        return false;
+
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+    double v = std::fabs(st.axesStatus[7].actualVelocity);
     return v <= 1.0;
 }
 
@@ -1449,7 +1764,7 @@ bool IsGripperOpenAndIdle()
         return false;
 
     // 2) GripOpen Task가 Done 상태인지 확인
-    TaskState openState = g_taskStatus[(int)TaskId::GripOpen].state.load();
+    TaskState openState = g_taskStatus[(int)TaskId::Open].state.load();
     return (openState == TaskState::Done);
 }
 
@@ -1460,7 +1775,7 @@ bool IsGripperClosedAndIdle()
         return false;
 
     // 2) GripClose Task가 Done 상태인지 확인
-    TaskState closeState = g_taskStatus[(int)TaskId::GripClose].state.load();
+    TaskState closeState = g_taskStatus[(int)TaskId::Close].state.load();
     return (closeState == TaskState::Done);
 }
 
@@ -1490,7 +1805,7 @@ bool WaitAllAxesStopped(double velEps, DWORD timeoutMs)
         g_cm.GetStatus(&st);
 
         bool allStopped = true;
-        for (int ax = 0; ax < 4; ++ax) {
+        for (int ax = 0; ax < 9; ++ax) {
             double v = std::fabs(st.axesStatus[ax].actualVelocity);
             if (v > velEps) {
                 allStopped = false;
@@ -1498,12 +1813,8 @@ bool WaitAllAxesStopped(double velEps, DWORD timeoutMs)
             }
         }
 
-        // ★ GripServoOff 태스크 상태 읽기
-        TaskState servoOffState = g_taskStatus[(int)TaskId::GripServoOff].state.load(std::memory_order_relaxed);
-        bool servoOffDone = (servoOffState == TaskState::Done);
-
         // 둘 다 만족해야 "정지 완료"로 인정
-        if (allStopped && servoOffDone) {
+        if (allStopped) {
             return true;    // 모든 축 멈췄고, GripServoOff도 Done
         }
 
@@ -1615,7 +1926,7 @@ static bool CheckDemoUnloadPreconditions()
     return true;
 }
 
-void DoGripServoOff_Compat(HWND hWnd);
+void DoGripServoOff_Compat(HWND hWnd) {};
 
 
 // =======================================
@@ -1624,7 +1935,7 @@ void DoGripServoOff_Compat(HWND hWnd);
 void DoOpen_Compat(HWND hWnd)
 {
     // 그리퍼 Open 명령 시작
-    SetTaskState(TaskId::GripOpen, TaskState::Running);
+    SetTaskState(TaskId::Open, TaskState::Running);
 
 
     //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
@@ -1632,7 +1943,7 @@ void DoOpen_Compat(HWND hWnd)
 
        // 2) Close OFF
     ToggleDO_HW(9, false, hWnd);
-    SetTaskState(TaskId::GripClose, TaskState::Idle);
+    SetTaskState(TaskId::Close, TaskState::Idle);
 
     // 3) Open 신호: 8번을 한번 OFF 했다가 ON (에지 만들기)
     ToggleDO_HW(8, false, hWnd);
@@ -1644,14 +1955,14 @@ void DoOpen_Compat(HWND hWnd)
 void DoClose_Compat(HWND hWnd)
 {
     // 그리퍼 Close 명령 시작
-    SetTaskState(TaskId::GripClose, TaskState::Running);
+    SetTaskState(TaskId::Close, TaskState::Running);
 
     // 1) STO 펄스
     //DoGripServoOff_Compat(hWnd);
 
     // 2) Open OFF
     ToggleDO_HW(8, false, hWnd);
-    SetTaskState(TaskId::GripOpen, TaskState::Idle);
+    SetTaskState(TaskId::Open, TaskState::Idle);
 
     // 3) Close 신호: 9번을 한번 OFF 했다가 ON (에지 만들기)
     ToggleDO_HW(9, false, hWnd);
@@ -1660,318 +1971,104 @@ void DoClose_Compat(HWND hWnd)
 
 }
 
-void DoGripServoOff_Compat(HWND hWnd) {
-    ToggleDO_HW(10, true, hWnd); // STO ON (펄스)
-    ToggleDO_HW(10, false, hWnd); // STO ON (펄스)
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    ToggleDO_HW(11, false, hWnd); // LED OFF
-    SetTaskState(TaskId::GripServoOff, TaskState::Done);
-}
+//void DoGripServoOff_Compat(HWND hWnd) {
+//    ToggleDO_HW(10, true, hWnd); // STO ON (펄스)
+//    ToggleDO_HW(10, false, hWnd); // STO ON (펄스)
+//    std::this_thread::sleep_for(std::chrono::seconds(1));
+//    ToggleDO_HW(11, false, hWnd); // LED OFF
+//    SetTaskState(TaskId::GripServoOff, TaskState::Done);
+//}
 
 void WorkDown() {
-    if (!g_commStarted) { SetTaskState(TaskId::WorkDown, TaskState::Failed); return; }
+    if (!g_commStarted) { SetTaskState(TaskId::HoistDown, TaskState::Failed); return; }
     int ax = 2;
     long long tgt = 45000;
-    StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 15000,
         3000.0, { 1000.0, 80.0, 10.0 });
 }
-void ConveyorDown() {
-    if (!g_commStarted) { SetTaskState(TaskId::ConveyorDown, TaskState::Failed); return; }
+void HoistDown() {
+    if (!g_commStarted) { SetTaskState(TaskId::HoistDown, TaskState::Failed); return; }
     int ax = 2;
     long long tgt = 51600;
-    StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });
 }
-void DoUp() {
-    if (!g_commStarted) { SetTaskState(TaskId::LiftUp, TaskState::Failed); return; }
+void HoistUp() {
+    if (!g_commStarted) { SetTaskState(TaskId::HoistUp, TaskState::Failed); return; }
     int ax = 2; long long tgt = 0;
     // 필드 순서: axis, target, task, velEps, posEps, timeoutMs, treatStoppedAsDone
-    MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
+    MoveMonitorArgs m{ ax, tgt, TaskId::HoistUp, 10.0, 2.0, 15000, true };
     StartMoveAndMonitor(m, 10000.0, 3000.0, 1500.0);
 }
 void DoStopAll(HWND hWnd) {
     DoGripServoOff_Compat(hWnd);
     g_bcRunner.Stop();
-    for (int a = 0; a < 4; ++a) StopAxis(a);
+    for (int a = 0; a < 9; ++a) StopAxis(a);
     for (int i = 0; i < (int)TaskId::COUNT; ++i) {
         if (g_taskStatus[i].state.load() == TaskState::Running) SetTaskState((TaskId)i, TaskState::Stopped);
     }
-    // 펄스 예약 해제
-    for (int i = 0; i < 16; ++i) g_outputPendingOff[i] = false;
 }
-void Go_Workstation() {
+void GoWorkstation() {
     if (!g_commStarted) { SetTaskState(TaskId::GoWorkstation, TaskState::Failed); return; }
     BarcodeParams p{};
-    p.axis = 0;
-    p.targetBarcodeAbs = 491332;
-    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
-    p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
+    p.axis = 7;
+    p.targetBarcodeAbs = 1400;
+    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 2;
-    p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
+    p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
     g_bcRunner.Start(p, TaskId::GoWorkstation);
 }
-void GO_Conveyor() {
-    if (!g_commStarted) { SetTaskState(TaskId::GoConveyor, TaskState::Failed); return; }
+void GoLeft() {
+    if (!g_commStarted) { SetTaskState(TaskId::GoLeft, TaskState::Failed); return; }
     BarcodeParams p{};
-    p.axis = 0;
-    p.targetBarcodeAbs = 476774;
-    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
-    p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
+    p.axis = 7;
+    p.targetBarcodeAbs = 509;
+    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 2;
-    p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
-    g_bcRunner.Start(p, TaskId::GoConveyor);
+    p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
+    g_bcRunner.Start(p, TaskId::GoLeft);
 }
 
-// 원점 with Box 시퀀스
-void StartDemoHomeWithBox()
+void GoRight() {
+    if (!g_commStarted) { SetTaskState(TaskId::GoRight, TaskState::Failed); return; }
+    BarcodeParams p{};
+    p.axis = 7;
+    p.targetBarcodeAbs = 2475;
+    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
+    p.deadband = 2;
+    p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
+    g_bcRunner.Start(p, TaskId::GoRight);
+}
+
+static void RunTempTask(TaskId id, int ms = 400)
 {
-    if (!g_commStarted) {
-        SetTaskState(TaskId::DemoHomeWithBox, TaskState::Failed);
-        return;
-    }
+    if (!g_commStarted) { SetTaskState(id, TaskState::Failed); return; }
+    if (g_taskStatus[(int)id].state.load() == TaskState::Running) return;
 
-    // ★ 박스가 없으면 시퀀스 시작하지 않음
-    if (!HasBox()) {
-        SetTaskState(TaskId::DemoHomeWithBox, TaskState::Failed);
-
-        // 필요하면 안내 메시지도 가능
-        // if (g_hDemoWnd) {
-        //     MessageBox(g_hDemoWnd,
-        //         TEXT("원점 with Box 시퀀스를 시작할 수 없습니다.\n")
-        //         TEXT("조건: HasBox == TRUE (Catched ON)"),
-        //         TEXT("Demo Home(Box)"),
-        //         MB_ICONWARNING);
-        // }
-
-        return;
-    }
-
-    if (g_taskStatus[(int)TaskId::DemoHomeWithBox].state.load() == TaskState::Running)
-        return;
-
-    SetTaskState(TaskId::DemoHomeWithBox, TaskState::Running);
-
-    std::thread([]() {
-        bool ok = true;
-
-        // 1. 그리퍼 Close (박스 잡기)  → Close 상태 될 때까지 대기
-        DoClose_Compat(g_hDemoWnd);
-        if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
-            ok = false;
-
-        // 2. 축2 Up  → Axis2 Up 상태까지 대기
-        if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
-                ok = false;
-        }
-
-        // 3. Workstation 위치로 이동  → 바코드 기준 Workstation 도달까지 대기
-        if (ok) {
-            Go_Workstation();
-            if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        // 4. WorkDown (작업 위치로 하강)  → Axis2 WorkDown 도달까지 대기
-        if (ok) {
-            WorkDown();
-            if (!WaitUntil(IsAxis2Workdown, 20000))
-                ok = false;
-        }
-
-        // 5. 그리퍼 Open (놓기)  → 그리퍼가 Open 출력 상태가 될 때까지 대기
-        if (ok) {
-            DoOpen_Compat(g_hDemoWnd);
-            if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-                ok = false;
-        }
-
-        // 6. 축2 Up  → 다시 Up 도달까지 대기
-        if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
-                ok = false;
-        }
-
-        // 7. Conveyor 위치로 이동  → 바코드 기준 Conveyor 도달까지 대기
-        if (ok) {
-            GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        SetTaskState(TaskId::DemoHomeWithBox, ok ? TaskState::Done : TaskState::Failed);
+    SetTaskState(id, TaskState::Running);
+    std::thread([id, ms]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        // TODO: 실제 모션/IO 연동으로 교체
+        SetTaskState(id, TaskState::Done);
         }).detach();
 }
 
+void Forward() { }
+void Backward() { }
 
-// 원점 without Box 시퀀스
-void StartDemoHomeWithoutBox()
-{
-    if (!g_commStarted) {
-        SetTaskState(TaskId::DemoHomeWithoutBox, TaskState::Failed);
-        return;
-    }
+void Forking() { }
+void Unforking() { }
 
-    // 박스 있으면 실행 안 함 (== 박스 없을 때만 실행)
-    if (!NoBox()) {
-        SetTaskState(TaskId::DemoHomeWithoutBox, TaskState::Failed);
-        return;
-    }
-
-    if (g_taskStatus[(int)TaskId::DemoHomeWithoutBox].state.load() == TaskState::Running)
-        return;
-
-    SetTaskState(TaskId::DemoHomeWithoutBox, TaskState::Running);
-
-    std::thread([]() {
-        bool ok = true;
-
-        // 1. 그리퍼 Open (박스 없음) → Open 상태까지 대기
-        DoOpen_Compat(g_hDemoWnd);
-        if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-            ok = false;
-
-        // 2. 축2 Up → Up 도달까지 대기
-        if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
-                ok = false;
-        }
-
-        // 3. Conveyor 위치로 이동 → Conveyor 바코드 도달까지 대기
-        if (ok) {
-            GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        SetTaskState(TaskId::DemoHomeWithoutBox, ok ? TaskState::Done : TaskState::Failed);
-        }).detach();
-}
-
-// 원점 with Box 시퀀스
-void StartDemoWorkWithBox()
-{
-    if (!g_commStarted) {
-        SetTaskState(TaskId::DemoWorkWithBox, TaskState::Failed);
-        return;
-    }
-
-    // ★ 박스가 없으면 시퀀스 시작하지 않음
-    if (!HasBox()) {
-        SetTaskState(TaskId::DemoWorkWithBox, TaskState::Failed);
-
-        // 필요하면 안내 메시지도 가능
-        // if (g_hDemoWnd) {
-        //     MessageBox(g_hDemoWnd,
-        //         TEXT("원점 with Box 시퀀스를 시작할 수 없습니다.\n")
-        //         TEXT("조건: HasBox == TRUE (Catched ON)"),
-        //         TEXT("Demo Home(Box)"),
-        //         MB_ICONWARNING);
-        // }
-
-        return;
-    }
-
-    if (g_taskStatus[(int)TaskId::DemoWorkWithBox].state.load() == TaskState::Running)
-        return;
-
-    SetTaskState(TaskId::DemoWorkWithBox, TaskState::Running);
-
-    std::thread([]() {
-        bool ok = true;
-
-        // 1. Workstation 위치로 이동  → 바코드 기준 Workstation 도달까지 대기
-        if (ok) {
-            Go_Workstation();
-            if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        // 2. WorkDown (작업 위치로 하강)  → Axis2 WorkDown 도달까지 대기
-        if (ok) {
-            WorkDown();
-            if (!WaitUntil(IsAxis2Workdown, 20000))
-                ok = false;
-        }
-
-        // 3. 그리퍼 Open (놓기)  → 그리퍼가 Open 출력 상태가 될 때까지 대기
-        if (ok) {
-            DoOpen_Compat(g_hDemoWnd);
-            if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-                ok = false;
-        }
-
-        // 4. 축2 Up  → Axis2 Up 상태까지 대기
-        if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
-                ok = false;
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        // 5. Conveyor 위치로 이동  → 바코드 기준 Conveyor 도달까지 대기
-        if (ok) {
-            GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        SetTaskState(TaskId::DemoWorkWithBox, ok ? TaskState::Done : TaskState::Failed);
-        }).detach();
-}
-
-
-// 원점 without Box 시퀀스
-void StartDemoWorkWithoutBox()
-{
-    if (!g_commStarted) {
-        SetTaskState(TaskId::DemoWorkWithoutBox, TaskState::Failed);
-        return;
-    }
-
-    // 박스 있으면 실행 안 함 (== 박스 없을 때만 실행)
-    if (!NoBox()) {
-        SetTaskState(TaskId::DemoWorkWithoutBox, TaskState::Failed);
-        return;
-    }
-
-    if (g_taskStatus[(int)TaskId::DemoWorkWithoutBox].state.load() == TaskState::Running)
-        return;
-
-    SetTaskState(TaskId::DemoWorkWithoutBox, TaskState::Running);
-
-    std::thread([]() {
-        bool ok = true;
-
-        // 1. 그리퍼 Open (박스 없음) → Open 상태까지 대기
-        DoOpen_Compat(g_hDemoWnd);
-        if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-            ok = false;
-
-        // 2. 축2 Up → Up 도달까지 대기
-        if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
-                ok = false;
-        }
-
-        // 3. Conveyor 위치로 이동 → Conveyor 바코드 도달까지 대기
-        if (ok) {
-            GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
-                ok = false;
-        }
-
-        SetTaskState(TaskId::DemoWorkWithoutBox, ok ? TaskState::Done : TaskState::Failed);
-        }).detach();
-}
-
+// Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
+void Down() {}
+void Up() {}
 
 // Load 시퀀스: Conveyor → Workstation
 void StartDemoLoad()
@@ -1989,7 +2086,7 @@ void StartDemoLoad()
 
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
-            DoUp();
+            HoistUp();
             (void)WaitUntil(IsAxis2Up, 20000);
         }
 
@@ -2036,8 +2133,8 @@ void StartDemoLoad()
             if (code == 0x01) {
             }
             else {
-                GO_Conveyor();
-                if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000)) {
+                GoLeft();
+                if (!WaitUntil(IsAxisLeftStopped, 30000)) {
                     ok = false;
                 }
                 Sleep(1000);
@@ -2046,7 +2143,7 @@ void StartDemoLoad()
 
         // 1. ConveyorDown (박스 높이로 하강)
         if (ok) {
-            ConveyorDown();
+            HoistDown();
             // 축2가 ConveyorDown 위치에 도달할 때까지 대기
             if (!WaitUntil(IsAxis2Conveyordown, 20000))
                 ok = false;
@@ -2062,7 +2159,7 @@ void StartDemoLoad()
 
         // 3. 축2 Up
         if (ok) {
-            DoUp();
+            HoistUp();
             if (!WaitUntil(IsAxis2Up, 20000))
                 ok = false;
         }
@@ -2085,7 +2182,7 @@ void StartDemoUnload()
 
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
-            DoUp();
+            HoistUp();
             (void)WaitUntil(IsAxis2Up, 20000);
         }
 
@@ -2134,8 +2231,8 @@ void StartDemoUnload()
                 // 이미 Workstation 바코드 위치 → 이동 스킵
             }
             else {
-                Go_Workstation();
-                if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
+                GoWorkstation();
+                if (!WaitUntil(IsAxisWorkstationStopped, 30000))
                     ok = false;
             }
             Sleep(1000);
@@ -2159,20 +2256,47 @@ void StartDemoUnload()
 
         // 4. 축2 Up
         if (ok) {
-            DoUp();
+            HoistUp();
             if (!WaitUntil(IsAxis2Up, 20000))
                 ok = false;
         }
 
         // 5. Conveyor 위치로 이동
         if (ok) {
-            GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
+            GoLeft();
+            if (!WaitUntil(IsAxisLeftStopped, 30000))
                 ok = false;
         }
         Sleep(1000);
 
         SetTaskState(TaskId::DemoUnload, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+
+// 전체 Demo: (임시 구현) DemoLoad → DemoUnload 순서로 실행
+void StartAllDemo()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::All_Demo, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::All_Demo].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::All_Demo, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+
+        // 1) DemoLoad
+        StartDemoLoad();
+        if (!WaitTaskFinished(TaskId::DemoLoad, 5000))
+            ok = false;
+
+        // 2) DemoUnload
+        if (ok) {
+            StartDemoUnload();
+            if (!WaitTaskFinished(TaskId::DemoUnload, 5000))
+                ok = false;
+        }
+
+        SetTaskState(TaskId::All_Demo, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
 }
 
@@ -2186,19 +2310,30 @@ enum : UINT_PTR {
     IDT_GPIO_REFRESH = 0x2002
 };
 enum : int {
-    // Demo 우측 버튼들
-    ID_BTN_WORKSTATION = 11001,
-    ID_BTN_CONVEYOR,
+    // Right-panel buttons
+    ID_BTN_GOLEFT = 11001,
+    ID_BTN_GOWORKSTATION,
+    ID_BTN_GORIGHT,
+
+    ID_BTN_FORWARD,
+    ID_BTN_BACKWARD,
+
     ID_BTN_UP,
-    ID_BTN_WORK_DOWN,
-    ID_BTN_CONVEYOR_DOWN,
-    ID_BTN_STOP_ALL,
-    ID_BTN_DEMO_HOME_WITH_BOX,
-    ID_BTN_DEMO_HOME_WITHOUT_BOX,
-    ID_BTN_DEMO_Work_WITH_BOX,
-    ID_BTN_DEMO_Work_WITHOUT_BOX,
+    ID_BTN_DOWN,
+
+    ID_BTN_FORKING,
+    ID_BTN_UNFORKING,
+    ID_BTN_OPEN,
+    ID_BTN_CLOSE,
+
+    ID_BTN_HOIST_UP,
+    ID_BTN_HOIST_DOWN,
+
+    ID_BTN_ALL_DEMO,
     ID_BTN_DEMO_LOAD,
-    ID_BTN_DEMO_UNLOAD
+    ID_BTN_DEMO_UNLOAD,
+
+    ID_BTN_STOP_ALL
 };
 
 static void CreateStatusArea(HWND h, int x, int y, int w, int hgt) {
@@ -2286,107 +2421,143 @@ static void CreateLeftGPIOUI(HWND h, HINSTANCE hInst, int x, int y, int w, int h
 static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
 {
     HFONT hBtn = MakeUIFont(12);
-
     int yCursor = y;
 
-    // Motion 그룹
-    int grpH1 = 160;
-    CreateWindow(TEXT("BUTTON"), TEXT("Motion"),
-        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        x, yCursor, w, grpH1, h, 0, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Workstation"),
-        WS_CHILD | WS_VISIBLE,
-        x + 20, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_WORKSTATION, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Conveyor"),
-        WS_CHILD | WS_VISIBLE,
-        x + 180, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_CONVEYOR, 0, 0);
-    yCursor += grpH1 + 12;
+    auto addGroup = [&](const TCHAR* title, int height) {
+        CreateWindow(TEXT("BUTTON"), title, WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            x, yCursor, w, height, h, 0, 0, 0);
+        int top = yCursor + 30;
+        int left = x + 16;
+        return std::pair<int, int>(left, top);
+        };
 
-    // Lift / Down 그룹
-    int grpH2 = 180;
-    CreateWindow(TEXT("BUTTON"), TEXT("Lift / Down"),
-        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        x, yCursor, w, grpH2, h, 0, 0, 0);
+    const int gapY = 10;
+    const int btnH = 32;
+    const int padX = 16;
 
-    CreateWindow(TEXT("BUTTON"), TEXT("UP"),
-        WS_CHILD | WS_VISIBLE,
-        x + 20, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_UP, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Work Down"),
-        WS_CHILD | WS_VISIBLE,
-        x + 180, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_WORK_DOWN, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Conveyor Down"),
-        WS_CHILD | WS_VISIBLE,
-        x + 340, yCursor + 40, 160, 32, h, (HMENU)ID_BTN_CONVEYOR_DOWN, 0, 0);
-    yCursor += grpH2 + 12;
+    // 1) Main주행
+    {
+        int grpH = 78;
+        auto [bx, by] = addGroup(TEXT("Main주행"), grpH);
 
-    // Demo Sequence 그룹 (새로 추가)
-    int grpHd = 160;
-    CreateWindow(TEXT("BUTTON"), TEXT("Demo Sequence"),
-        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        x, yCursor, w, grpHd, h, 0, 0, 0);
+        int btnW = (w - padX * 2 - 20) / 3;
+        CreateWindow(TEXT("BUTTON"), TEXT("GoLeft"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_GOLEFT, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("GoWorkstation"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_GOWORKSTATION, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("GoRight"), WS_CHILD | WS_VISIBLE,
+            bx + (btnW + 10) * 2, by, btnW, btnH, h, (HMENU)ID_BTN_GORIGHT, 0, 0);
 
-    int btnW = 160;
-    int btnH = 32;
-    int colGap = 20;
-    int startX = x + 20;
-    int startY = yCursor + 40;
+        yCursor += grpH + gapY;
+    }
 
-    // 2열 × 2행 배치
-    CreateWindow(TEXT("BUTTON"), TEXT("원점 with Box"),
-        WS_CHILD | WS_VISIBLE,
-        startX, startY, btnW, btnH, h, (HMENU)ID_BTN_DEMO_HOME_WITH_BOX, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("원점 without Box"),
-        WS_CHILD | WS_VISIBLE,
-        startX + btnW + colGap, startY, btnW, btnH, h, (HMENU)ID_BTN_DEMO_HOME_WITHOUT_BOX, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Load"),
-        WS_CHILD | WS_VISIBLE,
-        startX, startY + btnH + 10, btnW, btnH, h, (HMENU)ID_BTN_DEMO_LOAD, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Unload"),
-        WS_CHILD | WS_VISIBLE,
-        startX + btnW + colGap, startY + btnH + 10, btnW, btnH, h, (HMENU)ID_BTN_DEMO_UNLOAD, 0, 0);
+    // 2) Side주행
+    {
+        int grpH = 78;
+        auto [bx, by] = addGroup(TEXT("Side주행"), grpH);
 
-    CreateWindow(TEXT("BUTTON"), TEXT("Work with Box"),
-        WS_CHILD | WS_VISIBLE,
-        startX + btnW * 2 + colGap * 2, startY, btnW, btnH, h, (HMENU)ID_BTN_DEMO_Work_WITH_BOX, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("Work without Box"),
-        WS_CHILD | WS_VISIBLE,
-        startX + btnW * 2 + colGap * 2, startY + btnH + 10, btnW, btnH, h, (HMENU)ID_BTN_DEMO_Work_WITHOUT_BOX, 0, 0);
+        int btnW = (w - padX * 2 - 10) / 2;
+        CreateWindow(TEXT("BUTTON"), TEXT("Forward"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_FORWARD, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Backward"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_BACKWARD, 0, 0);
 
-    yCursor += grpHd + 12;
+        yCursor += grpH + gapY;
+    }
 
-    // STOP 그룹
-    int grpH3 = 100;
-    CreateWindow(TEXT("BUTTON"), TEXT("STOP"),
-        WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-        x, yCursor, w, grpH3, h, 0, 0, 0);
-    CreateWindow(TEXT("BUTTON"), TEXT("STOP ALL"),
-        WS_CHILD | WS_VISIBLE,
-        x + (w - 140) / 2, yCursor + 40, 140, 34, h, (HMENU)ID_BTN_STOP_ALL, 0, 0);
-    yCursor += grpH3 + 12;
+    // 3) 본체 업다운
+    {
+        int grpH = 78;
+        auto [bx, by] = addGroup(TEXT("본체 업다운"), grpH);
 
-    // Status 상자: 라인 수에 넉넉하게
-    int statusLines = (int)TaskId::COUNT;
-    int lineH = 24;
-    int statusH = 25 + statusLines * (lineH + 6) + 10;
-    CreateStatusArea(h, x, yCursor, w, statusH);
-    yCursor += statusH + 12;
+        int btnW = (w - padX * 2 - 10) / 2;
+        CreateWindow(TEXT("BUTTON"), TEXT("Up"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_UP, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Down"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_DOWN, 0, 0);
 
-    // Axis2 센서 라벨
-    g_hAx2LimitStatic = CreateWindow(TEXT("STATIC"), TEXT("Axis2 LIMIT: -"),
-        WS_CHILD | WS_VISIBLE, x + 10, yCursor, w / 2 - 20, 24, h, 0, 0, 0);
-    g_hAx2HomeStatic = CreateWindow(TEXT("STATIC"), TEXT("Axis2 HOME: -"),
-        WS_CHILD | WS_VISIBLE, x + w / 2 + 10, yCursor, w / 2 - 20, 24, h, 0, 0, 0);
-    yCursor += 40;
+        yCursor += grpH + gapY;
+    }
+
+    // 4) 포킹부
+    {
+        int grpH = 120;
+        auto [bx, by] = addGroup(TEXT("포킹부"), grpH);
+
+        int btnW = (w - padX * 2 - 10) / 2;
+        CreateWindow(TEXT("BUTTON"), TEXT("Forking"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_FORKING, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Unforking"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_UNFORKING, 0, 0);
+
+        CreateWindow(TEXT("BUTTON"), TEXT("Open"), WS_CHILD | WS_VISIBLE,
+            bx, by + btnH + 10, btnW, btnH, h, (HMENU)ID_BTN_OPEN, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Close"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by + btnH + 10, btnW, btnH, h, (HMENU)ID_BTN_CLOSE, 0, 0);
+
+        yCursor += grpH + gapY;
+    }
+
+    // 5) 승하강부
+    {
+        int grpH = 78;
+        auto [bx, by] = addGroup(TEXT("승하강부"), grpH);
+
+        int btnW = (w - padX * 2 - 10) / 2;
+        CreateWindow(TEXT("BUTTON"), TEXT("HoistUp"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_HOIST_UP, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("HoistDown"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_HOIST_DOWN, 0, 0);
+
+        yCursor += grpH + gapY;
+    }
+
+    // 6) Demo
+    {
+        int grpH = 110;
+        auto [bx, by] = addGroup(TEXT("Demo"), grpH);
+
+        int btnW = (w - padX * 2 - 20) / 3;
+        CreateWindow(TEXT("BUTTON"), TEXT("All_Demo"), WS_CHILD | WS_VISIBLE,
+            bx, by, btnW, btnH, h, (HMENU)ID_BTN_ALL_DEMO, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("DemoLoad"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_DEMO_LOAD, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("DemoUnload"), WS_CHILD | WS_VISIBLE,
+            bx + (btnW + 10) * 2, by, btnW, btnH, h, (HMENU)ID_BTN_DEMO_UNLOAD, 0, 0);
+
+        // STOP ALL 버튼을 Demo 그룹 아래에 크게 하나 배치
+        CreateWindow(TEXT("BUTTON"), TEXT("STOP ALL"), WS_CHILD | WS_VISIBLE,
+            bx, by + btnH + 12, w - padX * 2, 36, h, (HMENU)ID_BTN_STOP_ALL, 0, 0);
+
+        yCursor += grpH + gapY;
+    }
+
+    // Status 박스
+    {
+        int statusLines = (int)TaskId::COUNT;
+        int lineH = 22;
+        int statusH = 25 + statusLines * (lineH + 6) + 10;
+        if (yCursor + statusH > y + hgt) {
+            statusH = std::max(120, (y + hgt) - yCursor - 10);
+        }
+        CreateStatusArea(h, x, yCursor, w, statusH);
+        yCursor += statusH + gapY;
+    }
 
     // 버튼 폰트 적용
     for (int id : {
-        ID_BTN_WORKSTATION, ID_BTN_CONVEYOR, ID_BTN_UP,
-            ID_BTN_WORK_DOWN, ID_BTN_CONVEYOR_DOWN, ID_BTN_STOP_ALL,
-            ID_BTN_DEMO_HOME_WITH_BOX, ID_BTN_DEMO_HOME_WITHOUT_BOX,
-            ID_BTN_DEMO_LOAD, ID_BTN_DEMO_UNLOAD }) {
-        HWND b = GetDlgItem(h, id);
-        if (b) SendMessage(b, WM_SETFONT, (WPARAM)hBtn, TRUE);
+        ID_BTN_GOLEFT, ID_BTN_GOWORKSTATION, ID_BTN_GORIGHT,
+            ID_BTN_FORWARD, ID_BTN_BACKWARD,
+            ID_BTN_UP, ID_BTN_DOWN,
+            ID_BTN_FORKING, ID_BTN_UNFORKING, ID_BTN_OPEN, ID_BTN_CLOSE,
+            ID_BTN_HOIST_UP, ID_BTN_HOIST_DOWN,
+            ID_BTN_ALL_DEMO, ID_BTN_DEMO_LOAD, ID_BTN_DEMO_UNLOAD,
+            ID_BTN_STOP_ALL
+    })
+    {
+        if (HWND b = GetDlgItem(h, id)) SendMessage(b, WM_SETFONT, (WPARAM)hBtn, TRUE);
     }
+
     DeleteObject(hBtn);
 }
 
@@ -2409,6 +2580,8 @@ static void LayoutChildren(HWND hWnd) {
     int leftH = totalH - margin * 2;
     int rightH = leftH;
 
+    (void)rightX; (void)rightW; (void)leftH; (void)rightH;
+
     // 좌측 그룹을 전체 높이 사용
     // 만들어진 컨트롤을 재생성하지 않고, 그룹박스 기준으로는 별도 핸들을 보관하지 않았으므로
     // 자식들을 상대적 좌표로 만들었고, 여기서는 레이아웃 재구성이 필요하면 재생성하는 구조이나
@@ -2420,42 +2593,26 @@ static void LayoutChildren(HWND hWnd) {
     // 좌측 GPIO 영역은 CreateLeftGPIOUI 생성 당시 좌표 고정이므로 리사이즈 영향 최소화
     // 우측은 CreateRightDemoUI 생성 당시 좌표 고정이므로 역시 기본 창을 크게 유지하여 겹침 방지
 }
+static const TCHAR* kDemoClass = TEXT("WMX_DEMO_SHUTTLE");
 
 static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         g_hDemoWnd = hWnd;
-        s_servoOffHandledOnce = false;
-        ResetAllTaskStates();
-        Axis2SensorInit();
 
-        // GPIO 초기화
-        if (!EnumerateGPIO() || !PickBank_DI0_7_DO8_15()) {
-            MessageBox(hWnd, TEXT("GPIO unavailable or no bank for DI0..7 / DO8..15."), TEXT("GPIO Error"), MB_ICONERROR);
-        }
-        else {
-            (void)EnsureDO8to15AsOutput_BankFirst();
-        }
-
-        // 레이아웃
         RECT rc; GetClientRect(hWnd, &rc);
         int totalW = rc.right - rc.left;
         int totalH = rc.bottom - rc.top;
+
         int margin = 10;
         int gap = 10;
-
-        int leftW = 560;      // 좌측 GPIO 패널 폭 (확대)
+        int leftW = 560;
+        if (totalW < 900) leftW = totalW / 2 - gap;
         int rightX = margin + leftW + gap;
         int rightW = totalW - rightX - margin;
 
-        // 좌측 패널 생성
         CreateLeftGPIOUI(hWnd, ((LPCREATESTRUCT)lParam)->hInstance, margin, margin, leftW, totalH - margin * 2);
-
-        // 우측 패널 생성
         CreateRightDemoUI(hWnd, rightX, margin, rightW, totalH - margin * 2);
-
-        // 시작 시 레벨 리프레시
-        RefreshLevels(hWnd);
 
         // 타이머 시작
         SetTimer(hWnd, IDT_AX2_SENSOR_POLL, AX2_SENSOR_POLL_MS, nullptr);
@@ -2467,7 +2624,6 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     case WM_SIZE:
-        // 필요시 향후 동적 재배치 구현 가능
         LayoutChildren(hWnd);
         return 0;
 
@@ -2478,22 +2634,17 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (id >= 108 && id <= 115 && HIWORD(wParam) == BN_CLICKED) {
             HWND hSw = (HWND)lParam;
             int pin = id - 100;
-            // 현재 토글 상태 조회
             ToggleState* ts = (ToggleState*)GetWindowLongPtr(hSw, GWLP_USERDATA);
             bool on = ts ? ts->on : false;
 
-            // -----------------------------
-        // Open(8) / Close(9) 상호 배타 처리
-        // -----------------------------
+            // Open(8) / Close(9) 상호 배타 처리
             if (pin == 8 && on) {
-                // Open ON 이면 Close 강제 OFF
-                ToggleDO_HW(9, false, g_hDemoWnd);                 // HW + UI 둘 다 OFF
-                SetTaskState(TaskId::GripClose, TaskState::Idle);  // 상태도 정리(선택)
+                ToggleDO_HW(9, false, g_hDemoWnd);
+                SetTaskState(TaskId::Close, TaskState::Idle);
             }
             else if (pin == 9 && on) {
-                // Close ON 이면 Open 강제 OFF
                 ToggleDO_HW(8, false, g_hDemoWnd);
-                SetTaskState(TaskId::GripOpen, TaskState::Idle);
+                SetTaskState(TaskId::Open, TaskState::Idle);
             }
 
             // Open/Close는 STO 먼저
@@ -2502,28 +2653,36 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             }
             ToggleDO_HW(pin, on, g_hDemoWnd);
 
-            // Task state도 업데이트(옵션)
-            if (pin == 8) SetTaskState(TaskId::GripOpen, on ? TaskState::Running : TaskState::Stopped);
-            if (pin == 9) SetTaskState(TaskId::GripClose, on ? TaskState::Running : TaskState::Stopped);
-            if (pin == 10) SetTaskState(TaskId::GripServoOff, on ? TaskState::Running : TaskState::Stopped);
+            if (pin == 8) SetTaskState(TaskId::Open, on ? TaskState::Running : TaskState::Stopped);
+            if (pin == 9) SetTaskState(TaskId::Close, on ? TaskState::Running : TaskState::Stopped);
 
             return 0;
         }
 
-        // 우측 Demo 버튼들
         switch (id) {
-        case ID_BTN_WORKSTATION:          Go_Workstation();       return 0;
-        case ID_BTN_CONVEYOR:             GO_Conveyor();          return 0;
-        case ID_BTN_UP:                   DoUp();                 return 0;
-        case ID_BTN_WORK_DOWN:            WorkDown();             return 0;
-        case ID_BTN_CONVEYOR_DOWN:        ConveyorDown();         return 0;
-        case ID_BTN_STOP_ALL:             DoStopAll(hWnd);        return 0;
-        case ID_BTN_DEMO_HOME_WITH_BOX:   StartDemoHomeWithBox(); return 0;
-        case ID_BTN_DEMO_HOME_WITHOUT_BOX:StartDemoHomeWithoutBox(); return 0;
-        case ID_BTN_DEMO_Work_WITH_BOX:   StartDemoWorkWithBox(); return 0;
-        case ID_BTN_DEMO_Work_WITHOUT_BOX:StartDemoWorkWithoutBox(); return 0;
-        case ID_BTN_DEMO_LOAD:            StartDemoLoad();        return 0;
-        case ID_BTN_DEMO_UNLOAD:          StartDemoUnload();      return 0;
+        case ID_BTN_GOLEFT:          GoLeft();           return 0;
+        case ID_BTN_GOWORKSTATION:   GoWorkstation();    return 0;
+        case ID_BTN_GORIGHT:         GoRight();          return 0;
+
+        case ID_BTN_FORWARD:         Forward();          return 0;
+        case ID_BTN_BACKWARD:        Backward();         return 0;
+
+        case ID_BTN_UP:              Up();             return 0;
+        case ID_BTN_DOWN:            Down();             return 0;
+
+        case ID_BTN_FORKING:         Forking();          return 0;
+        case ID_BTN_UNFORKING:       Unforking();        return 0;
+        case ID_BTN_OPEN:            DoOpen_Compat(g_hDemoWnd);  return 0;
+        case ID_BTN_CLOSE:           DoClose_Compat(g_hDemoWnd); return 0;
+
+        case ID_BTN_HOIST_UP:        HoistUp();          return 0;
+        case ID_BTN_HOIST_DOWN:      HoistDown();        return 0;
+
+        case ID_BTN_ALL_DEMO:        StartAllDemo();     return 0;
+        case ID_BTN_DEMO_LOAD:       StartDemoLoad();    return 0;
+        case ID_BTN_DEMO_UNLOAD:     StartDemoUnload();  return 0;
+
+        case ID_BTN_STOP_ALL:        DoStopAll(hWnd);    return 0;
         default: break;
         }
         break;
@@ -2540,18 +2699,16 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 if (g_outputPendingOff[i]) {
                     if (now - g_outputOnTick[i] >= kOutputPulseMs) {
                         g_outputPendingOff[i] = false;
-                        ToggleDO_HW(i, false, g_hDemoWnd); // 자동 OFF
+                        ToggleDO_HW(i, false, g_hDemoWnd);
                     }
                 }
             }
+
             // 주기적으로 DI/DO 상태 갱신
             RefreshLevels(hWnd);
 
-            // =====================================
-        // Motioning(DI0) ↔ DO11 1:1 동기화
-        // =====================================
+            // Motioning(DI0) ↔ DO11 1:1 동기화 (DemoLoad/Unload 동작 중에는 제외)
             {
-                // DemoLoad / DemoUnload 상태 확인
                 TaskState loadState = GetTaskState(TaskId::DemoLoad);
                 TaskState unloadState = GetTaskState(TaskId::DemoUnload);
 
@@ -2559,14 +2716,10 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     (loadState == TaskState::Running) ||
                     (unloadState == TaskState::Running);
 
-                // ★ 데모 시퀀스가 "안 돌 때만" DI0→DO11 동기화 수행
                 if (!demoBusy) {
                     static bool s_prevDo11 = false;
-
-                    // 디바운스된 Motioning 입력 (DI0)
                     bool motioning = g_diStable[0];
 
-                    // 상태가 바뀔 때만 DO11을 갱신해서 쓸데없는 출력 반복 방지
                     if (motioning != s_prevDo11) {
                         ToggleDO_HW(11, motioning, g_hDemoWnd);
                         s_prevDo11 = motioning;
@@ -2577,16 +2730,10 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         break;
 
-    case WM_CLOSE:
-        DestroyWindow(hWnd);
-        return 0;
-
     case WM_DESTROY:
         KillTimer(hWnd, IDT_AX2_SENSOR_POLL);
         KillTimer(hWnd, IDT_GPIO_REFRESH);
-        g_bcRunner.Stop();
-        g_hDemoWnd = nullptr;
-        DeInitializeEAPI();
+        PostQuitMessage(0);
         return 0;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
