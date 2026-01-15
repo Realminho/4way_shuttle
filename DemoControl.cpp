@@ -691,7 +691,7 @@ static void StartMoveAndMonitor(const MoveMonitorArgs& m, double vpps, double ac
 }
 
 struct ApproachProfile {
-    double vpps = 1000.0;
+    double vpps = 500.0;
     double accMs = 100.0;
     double decMs = 100.0;
 };
@@ -864,31 +864,44 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
 }
 
 // =======================================
-// Axis2 Limit/Home 센서 (기존 유지)
+// Axis2 Limit/Home 센서 (기존 유지 + LIMIT 2개로 확장)
 // =======================================
 static HWND g_hAx2LimitStatic = nullptr;
 static HWND g_hAx2HomeStatic = nullptr;
-static const int AX2_LIMIT_ADDR = 8;
-static const int AX2_LIMIT_BIT = 1;
-static const int AX2_HOME_ADDR = 8;
-static const int AX2_HOME_BIT = 2;
-static const bool AX2_LIMIT_ACTIVE_HIGH = true;
+
+// --- LIMIT 센서 2개 (요청 반영) ---
+static const int AX4_LIMIT1_ADDR = 67;
+static const int AX4_LIMIT1_BIT = 0;
+static const int AX4_LIMIT2_ADDR = 67;
+static const int AX4_LIMIT2_BIT = 1;
+static const bool AX4_LIMIT1_ACTIVE_HIGH = true;
+static const bool AX4_LIMIT2_ACTIVE_HIGH = true;
+
+// --- HOME 센서 (기존 유지) ---
+static const int  AX2_HOME_ADDR = 8;
+static const int  AX2_HOME_BIT = 2;
 static const bool AX2_HOME_ACTIVE_HIGH = true;
+
+// 타이밍 (기존 유지)
 static const DWORD AX2_SENSOR_POLL_MS = 5;
 static const DWORD AX2_SENSOR_DEBOUNCE_MS = 5;
+static const DWORD AX2_SENSOR_ENABLE_DELAY_MS = 1500;
+
+// 상태 플래그들 (기존 유지)
 static std::atomic<bool> g_ax2LimitOn{ false };
 static std::atomic<bool> g_ax2HomeOn{ false };
-static std::atomic<bool>  g_ax2LimitLatched{ false };
-static std::atomic<bool>  g_ax2LimitBlocking{ false };
-static std::atomic<bool>  g_ax2StopIssuedOnLimit{ false };
-static std::atomic<bool>  g_ax2HomingStarted{ false };
-static std::atomic<bool>  g_ax2HomeDebounceOn{ false };
+static std::atomic<bool> g_ax2LimitLatched{ false };
+static std::atomic<bool> g_ax2LimitBlocking{ false };
+static std::atomic<bool> g_ax2StopIssuedOnLimit{ false };
+static std::atomic<bool> g_ax2HomingStarted{ false };
+static std::atomic<bool> g_ax2HomeDebounceOn{ false };
 static std::atomic<DWORD> g_ax2HomeLastTick{ 0 };
-static std::atomic<bool>  g_ax2HomeRampIssued{ false };
+static std::atomic<bool> g_ax2HomeRampIssued{ false };
 static std::atomic<DWORD> g_ax2LimitIdleTime{ 0 };
-static std::atomic<bool>  g_ax2ServoReady{ false };
+static std::atomic<bool> g_ax2ServoReady{ false };
 static std::atomic<DWORD> g_ax2ServoOnTime{ 0 };
-static const DWORD AX2_SENSOR_ENABLE_DELAY_MS = 1500;
+
+// 판정 파라미터 (기존 유지)
 static const double vel_idle_threshold = 1.0;
 static const long long inpos_tol_counts = 10;
 
@@ -896,8 +909,9 @@ static bool IsAxis2ServoOn()
 {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    return st.axesStatus[2].servoOn;
+    return st.axesStatus[4].servoOn;
 }
+
 static bool ReadInputBitRaw(int addr, int bit, bool activeHigh) {
     if (!g_commStarted) return false;
     Io io(&g_wmx);
@@ -910,14 +924,14 @@ static bool ReadInputBitRaw(int addr, int bit, bool activeHigh) {
 static bool Axis2IsIdle() {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    int av = (int)std::lround(st.axesStatus[2].actualVelocity);
-    long long perr = (long long)st.axesStatus[2].posCmd - (long long)st.axesStatus[2].actualPos;
+    int av = (int)std::lround(st.axesStatus[4].actualVelocity);
+    long long perr = (long long)st.axesStatus[4].posCmd - (long long)st.axesStatus[4].actualPos;
     return (std::abs(av) <= vel_idle_threshold) && (std::llabs(perr) <= inpos_tol_counts);
 }
 static int Axis2CurrentDir() {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    double vcmd = st.axesStatus[2].velocityCmd;
+    double vcmd = st.axesStatus[4].velocityCmd;
     if (vcmd > vel_idle_threshold) return +1;
     if (vcmd < -vel_idle_threshold) return -1;
     return 0;
@@ -925,9 +939,9 @@ static int Axis2CurrentDir() {
 static void Axis2HomeSoftDecelTo500() {
     if (!g_commStarted) return;
     if (Axis2IsIdle()) return;
-    if (!EnsureServoOn(2) || !EnsurePosModeNoStop(2)) return;
+    if (!EnsureServoOn(4) || !EnsurePosModeNoStop(4)) return;
     CoreMotionStatus st{}; g_cm.GetStatus(&st);
-    long long cur = (long long)st.axesStatus[2].actualPos;
+    long long cur = (long long)st.axesStatus[4].actualPos;
     int dir = Axis2CurrentDir(); if (dir == 0) dir = +1;
     long long smallStep = 5000 * dir;
     long long softTarget = cur + smallStep;
@@ -935,7 +949,7 @@ static void Axis2HomeSoftDecelTo500() {
     double accMs = 80.0;
     double decMs = 10.0;
     Motion::PosCommand pc{};
-    pc.axis = 2; pc.target = softTarget;
+    pc.axis = 4; pc.target = softTarget;
     pc.profile.type = ProfileType::SCurve;
     pc.profile.velocity = (int)std::lround(newVel);
     pc.profile.acc = TimeMsToAcc(pc.profile.velocity, accMs);
@@ -947,15 +961,15 @@ void Axis2HandleLimitOnceAndHome() {
     if (!g_commStarted) return;
     if (!g_ax2LimitLatched.load()) return;
     if (!g_ax2StopIssuedOnLimit.exchange(true)) {
-        StopAxis(2);
+        StopAxis(4);
     }
     if (!Axis2IsIdle()) { g_ax2LimitIdleTime = 0; return; }
     if (g_ax2LimitIdleTime.load() == 0) { g_ax2LimitIdleTime = GetTickCount(); return; }
     DWORD elapsed = GetTickCount() - g_ax2LimitIdleTime.load();
     if (elapsed < 2000) return;
     if (!g_ax2HomingStarted.load()) {
-        if (EnsureServoOn(2) && EnsurePosModeNoStop(2)) {
-            g_home.StartHome(2);
+        if (EnsureServoOn(4) && EnsurePosModeNoStop(4)) {
+            g_home.StartHome(4);
             g_ax2HomingStarted = true;
         }
     }
@@ -991,10 +1005,21 @@ void Axis2SensorTimerProc(HWND)
             }
         }
     }
-    bool limitRaw = ReadInputBitRaw(AX2_LIMIT_ADDR, AX2_LIMIT_BIT, AX2_LIMIT_ACTIVE_HIGH);
+    // -------------------------------------------------------
+    // LIMIT: 2개 중 하나라도 ON이면 LIMIT ON 처리 (요청 반영)
+    // -------------------------------------------------------
+    bool limit1Raw = ReadInputBitRaw(AX4_LIMIT1_ADDR, AX4_LIMIT1_BIT, AX4_LIMIT1_ACTIVE_HIGH);
+    bool limit2Raw = ReadInputBitRaw(AX4_LIMIT2_ADDR, AX4_LIMIT2_BIT, AX4_LIMIT2_ACTIVE_HIGH);
+    bool limitRaw = (limit1Raw || limit2Raw);
+
+    // HOME (기존 유지)
     bool homeRaw = ReadInputBitRaw(AX2_HOME_ADDR, AX2_HOME_BIT, AX2_HOME_ACTIVE_HIGH);
-    g_ax2LimitOn = limitRaw; g_ax2HomeOn = homeRaw;
+
+    g_ax2LimitOn = limitRaw;
+    g_ax2HomeOn = homeRaw;
+
     UpdateAx2SensorLabels(g_ax2ServoReady.load(), limitRaw, homeRaw);
+
     if (g_ax2ServoReady.load()) {
         if (limitRaw) {
             if (!g_ax2LimitLatched.load()) {
@@ -1018,8 +1043,8 @@ void Axis2SensorTimerProc(HWND)
                 if (now - g_ax2HomeLastTick.load() >= AX2_SENSOR_DEBOUNCE_MS) {
                     g_ax2HomeDebounceOn = true;
                     if (!g_ax2HomeRampIssued.load()) {
-                        Axis2HomeSoftDecelTo500();
-                        g_ax2HomeRampIssued = true;
+                        //Axis2HomeSoftDecelTo500();
+                        //g_ax2HomeRampIssued = true;
                     }
                 }
             }
@@ -1979,19 +2004,10 @@ void DoClose_Compat(HWND hWnd)
 //    SetTaskState(TaskId::GripServoOff, TaskState::Done);
 //}
 
-void WorkDown() {
-    if (!g_commStarted) { SetTaskState(TaskId::HoistDown, TaskState::Failed); return; }
-    int ax = 2;
-    long long tgt = 45000;
-    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        10000.0, 1000.0, 1500.0,
-        10.0, 2.0, 15000,
-        3000.0, { 1000.0, 80.0, 10.0 });
-}
 void HoistDown() {
     if (!g_commStarted) { SetTaskState(TaskId::HoistDown, TaskState::Failed); return; }
-    int ax = 2;
-    long long tgt = 51600;
+    int ax = 4;
+    long long tgt = 68000;
     StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
@@ -1999,13 +2015,14 @@ void HoistDown() {
 }
 void HoistUp() {
     if (!g_commStarted) { SetTaskState(TaskId::HoistUp, TaskState::Failed); return; }
-    int ax = 2; long long tgt = 0;
-    // 필드 순서: axis, target, task, velEps, posEps, timeoutMs, treatStoppedAsDone
-    MoveMonitorArgs m{ ax, tgt, TaskId::HoistUp, 10.0, 2.0, 15000, true };
-    StartMoveAndMonitor(m, 10000.0, 3000.0, 1500.0);
+    int ax = 4;
+    long long tgt = 0;
+    StartMoveWithApproach(ax, tgt, TaskId::HoistUp,
+        10000.0, 1000.0, 1500.0,
+        10.0, 2.0, 30000,
+        3500, { 1000.0, 80.0, 10.0 });
 }
 void DoStopAll(HWND hWnd) {
-    DoGripServoOff_Compat(hWnd);
     g_bcRunner.Stop();
     for (int a = 0; a < 9; ++a) StopAxis(a);
     for (int i = 0; i < (int)TaskId::COUNT; ++i) {
@@ -2241,7 +2258,7 @@ void StartDemoUnload()
 
         // 2. WorkDown (작업 위치로 하강)
         if (ok) {
-            WorkDown();
+            HoistDown();
             if (!WaitUntil(IsAxis2Workdown, 20000))
                 ok = false;
         }

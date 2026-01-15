@@ -355,14 +355,14 @@ static const int AX0_LIMIT_L_BIT = 0;
 static const int AX0_LIMIT_R_ADDR = 0;
 static const int AX0_LIMIT_R_BIT = 1;
 
-static const int AX2_LIMIT_ADDR = 8;
-static const int AX2_LIMIT_BIT = 1;
-static const int AX2_HOME_ADDR = 8;
-static const int AX2_HOME_BIT = 2;
+static const int AX4_LIMIT1_ADDR = 67;
+static const int AX4_LIMIT1_BIT = 0;
+static const int AX4_LIMIT2_ADDR = 67;
+static const int AX4_LIMIT2_BIT = 1;
 
 // 센서 활성 레벨 (필요시 LOW → HIGH로 수정)
-static const bool AX2_LIMIT_ACTIVE_HIGH = true;
-static const bool AX2_HOME_ACTIVE_HIGH = true;
+static const bool AX4_LIMIT1_ACTIVE_HIGH = true;
+static const bool AX4_LIMIT2_ACTIVE_HIGH = true;
 static const bool AX0_LIMIT_L_ACTIVE_HIGH = true;
 static const bool AX0_LIMIT_R_ACTIVE_HIGH = true;
 
@@ -406,7 +406,7 @@ static std::atomic<bool> g_ax0BlockMinus{ false };         // Axis0 - 방향 명
 static bool IsAxis2ServoOn()
 {
 	g_cm.GetStatus(&g_status);
-	return g_status.axesStatus[2].servoOn;
+	return g_status.axesStatus[4].servoOn;
 }
 
 
@@ -743,7 +743,7 @@ inline unsigned char CalcPosTravelCode()
 // Axis2 리밋 센서 현재 상태
 inline bool IsAxis2LimitOn()
 {
-	return ReadInputBit(AX2_LIMIT_ADDR, AX2_LIMIT_BIT, AX2_LIMIT_ACTIVE_HIGH);
+	return ReadInputBit(AX4_LIMIT1_ADDR, AX4_LIMIT1_BIT, AX4_LIMIT1_ACTIVE_HIGH) || ReadInputBit(AX4_LIMIT2_ADDR, AX4_LIMIT2_BIT, AX4_LIMIT2_ACTIVE_HIGH);
 }
 
 // Auto 모드일 때만 적용되는 인터락: Axis0(주행) 시작 가능 여부
@@ -6354,8 +6354,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 
 			// 센서 읽기
-			bool limitRaw = ReadInputBit(AX2_LIMIT_ADDR, AX2_LIMIT_BIT, AX2_LIMIT_ACTIVE_HIGH);
-			bool homeRaw = ReadInputBit(AX2_HOME_ADDR, AX2_HOME_BIT, AX2_HOME_ACTIVE_HIGH);
+			bool limitRaw = ReadInputBit(AX4_LIMIT1_ADDR, AX4_LIMIT1_BIT, AX4_LIMIT1_ACTIVE_HIGH);
+			bool homeRaw = ReadInputBit(AX4_LIMIT2_ADDR, AX4_LIMIT2_BIT, AX4_LIMIT2_ACTIVE_HIGH);
 			g_ax2LimitOn = limitRaw;
 			g_ax2HomeOn = homeRaw;
 
