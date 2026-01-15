@@ -869,6 +869,10 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
 static HWND g_hAx2LimitStatic = nullptr;
 static HWND g_hAx2HomeStatic = nullptr;
 
+static std::wstring g_ax5UiExtra = L""; // AX5 extra UI text (side/check)
+// Added: AX0~AX5 limit sensor display (left panel)
+static HWND g_hAxLimitStatics[6] = { nullptr,nullptr,nullptr,nullptr,nullptr,nullptr }; // AX0..AX5 (AX4 reserved)
+
 // --- LIMIT 센서 2개 (요청 반영) ---
 static const int AX4_LIMIT1_ADDR = 67;
 static const int AX4_LIMIT1_BIT = 0;
@@ -877,15 +881,77 @@ static const int AX4_LIMIT2_BIT = 1;
 static const bool AX4_LIMIT1_ACTIVE_HIGH = true;
 static const bool AX4_LIMIT2_ACTIVE_HIGH = true;
 
-// --- HOME 센서 (기존 유지) ---
+//// --- HOME 센서 (기존 유지) ---
 static const int  AX2_HOME_ADDR = 8;
 static const int  AX2_HOME_BIT = 2;
 static const bool AX2_HOME_ACTIVE_HIGH = true;
 
 // 타이밍 (기존 유지)
-static const DWORD AX2_SENSOR_POLL_MS = 5;
-static const DWORD AX2_SENSOR_DEBOUNCE_MS = 5;
-static const DWORD AX2_SENSOR_ENABLE_DELAY_MS = 1500;
+static const DWORD AX4_SENSOR_POLL_MS = 5;
+static const DWORD AX4_SENSOR_DEBOUNCE_MS = 5;
+static const DWORD AX4_SENSOR_ENABLE_DELAY_MS = 1500;
+
+// ======================================================
+// Added limit sensors (AX0/AX1/AX2/AX3/AX5) - 2026-01-15
+// ======================================================
+static const int  AX0_LIMIT_ADDR = 65;
+static const int  AX0_LIMIT_BIT = 7;
+static const bool AX0_LIMIT_ACTIVE_HIGH = true;
+
+// AX0 limit location: set true if AX0 limit is at +end (positive direction),
+// set false if AX0 limit is at -end. This allows jogging away from an active limit.
+static const bool AX0_LIMIT_AT_POSITIVE_END = true;
+
+static const int  AX1_LIMIT1_ADDR = 65;
+static const int  AX1_LIMIT1_BIT = 5;
+static const bool AX1_LIMIT1_ACTIVE_HIGH = true;
+static const int  AX1_LIMIT2_ADDR = 65;
+static const int  AX1_LIMIT2_BIT = 6;
+static const bool AX1_LIMIT2_ACTIVE_HIGH = true;
+
+static const int  AX2_UPLIMIT_ADDR = 66;
+static const int  AX2_UPLIMIT_BIT = 7;
+static const bool AX2_UPLIMIT_ACTIVE_HIGH = true;
+
+static const int  AX3_UPLIMIT_ADDR = 66;
+static const int  AX3_UPLIMIT_BIT = 5;
+static const bool AX3_UPLIMIT_ACTIVE_HIGH = true;
+
+static const int  AX2_DOWNLIMIT_ADDR = 66;
+static const int  AX2_DOWNLIMIT_BIT = 6;
+static const bool AX2_DOWNLIMIT_ACTIVE_HIGH = true;
+
+static const int  AX3_DOWNLIMIT_ADDR = 66;
+static const int  AX3_DOWNLIMIT_BIT = 4;
+static const bool AX3_DOWNLIMIT_ACTIVE_HIGH = true;
+
+static const int  AX5_LIMIT1_ADDR = 66;
+static const int  AX5_LIMIT1_BIT = 0;
+static const bool AX5_LIMIT1_ACTIVE_HIGH = true;
+
+static const int  AX5_LIMIT2_ADDR = 66;
+static const int  AX5_LIMIT2_BIT = 1;
+static const bool AX5_LIMIT2_ACTIVE_HIGH = true;
+
+static const int  AX5_LIMIT3_ADDR = 66;
+static const int  AX5_LIMIT3_BIT = 2;
+static const bool AX5_LIMIT3_ACTIVE_HIGH = true;
+
+static const int  AX5_LIMIT4_ADDR = 66;
+static const int  AX5_LIMIT4_BIT = 3;
+static const bool AX5_LIMIT4_ACTIVE_HIGH = true;
+
+// Poll period for added limit logic
+static const DWORD AX_LIMIT_POLL_MS = 5;
+
+// AX0: if limit stays ON for >= 1s -> home (actpos->0)
+static const DWORD AX0_LIMIT_HOME_HOLD_MS = 1000;
+
+// AX5: decel profile (tune as needed)
+static const double AX5_DECEL_VEL_PPS = 800.0;
+static const double AX5_DECEL_ACC_MS = 120.0;
+static const double AX5_DECEL_DEC_MS = 120.0;
+static const long long AX5_DECEL_LOOKAHEAD_PULSE = 250000; // "far enough" target for slow approach
 
 // 상태 플래그들 (기존 유지)
 static std::atomic<bool> g_ax2LimitOn{ false };
@@ -1001,7 +1067,7 @@ void Axis2SensorTimerProc(HWND)
             if (g_ax2ServoOnTime.load() == 0) { g_ax2ServoOnTime = GetTickCount(); }
             else {
                 DWORD diff = GetTickCount() - g_ax2ServoOnTime.load();
-                if (diff >= AX2_SENSOR_ENABLE_DELAY_MS) g_ax2ServoReady = true;
+                if (diff >= AX4_SENSOR_ENABLE_DELAY_MS) g_ax2ServoReady = true;
             }
         }
     }
@@ -1040,7 +1106,7 @@ void Axis2SensorTimerProc(HWND)
         DWORD now = GetTickCount();
         if (homeRaw) {
             if (!g_ax2HomeDebounceOn.load()) {
-                if (now - g_ax2HomeLastTick.load() >= AX2_SENSOR_DEBOUNCE_MS) {
+                if (now - g_ax2HomeLastTick.load() >= AX4_SENSOR_DEBOUNCE_MS) {
                     g_ax2HomeDebounceOn = true;
                     if (!g_ax2HomeRampIssued.load()) {
                         //Axis2HomeSoftDecelTo500();
@@ -1679,7 +1745,7 @@ bool IsAxisWorkstationStopped()
 
 
 // 축2가 Up 위치(0 근처)인지 확인
-bool IsAxis2Up()
+bool IsAxis4Up()
 {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
@@ -1688,7 +1754,7 @@ bool IsAxis2Up()
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
-    const auto& ax = st.axesStatus[2];
+    const auto& ax = st.axesStatus[4];
 
     long long perr = (long long)ax.actualPos - targetPos;
     double    v = std::fabs(ax.actualVelocity);
@@ -1697,7 +1763,7 @@ bool IsAxis2Up()
 }
 
 // 축2가 Up 위치(0 근처)인지 확인
-bool IsAxis2Workdown()
+bool IsAxis4Workdown()
 {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
@@ -1706,7 +1772,7 @@ bool IsAxis2Workdown()
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
-    const auto& ax = st.axesStatus[2];
+    const auto& ax = st.axesStatus[4];
 
     long long perr = (long long)ax.actualPos - targetPos;
     double    v = std::fabs(ax.actualVelocity);
@@ -1715,7 +1781,7 @@ bool IsAxis2Workdown()
 }
 
 // 축2가 Up 위치(0 근처)인지 확인
-bool IsAxis2Conveyordown()
+bool IsAxis4Conveyordown()
 {
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
@@ -1724,7 +1790,7 @@ bool IsAxis2Conveyordown()
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
-    const auto& ax = st.axesStatus[2];
+    const auto& ax = st.axesStatus[4];
 
     long long perr = (long long)ax.actualPos - targetPos;
     double    v = std::fabs(ax.actualVelocity);
@@ -1907,7 +1973,7 @@ static bool CheckDemoLoadPreconditions()
     //    return false;
     //}
 
-    if (!IsAxis2Up()) {
+    if (!IsAxis4Up()) {
         // LOG("DemoLoad NG: Axis2 not Up");
         return false;
     }
@@ -1937,7 +2003,7 @@ static bool CheckDemoUnloadPreconditions()
     //    return false;
 
     // 2) 축2가 Up 위치인가?
-    if (!IsAxis2Up())
+    if (!IsAxis4Up())
         return false;
 
     // 3) Gripper가 Close 상태인가?
@@ -1957,42 +2023,35 @@ void DoGripServoOff_Compat(HWND hWnd) {};
 // =======================================
 // Demo 동작: Lift/Down/Go, Stop
 // =======================================
-void DoOpen_Compat(HWND hWnd)
-{
-    // 그리퍼 Open 명령 시작
-    SetTaskState(TaskId::Open, TaskState::Running);
+//void DoOpen_Compat(HWND hWnd)
+//{
+//    // 그리퍼 Open 명령 시작
+//    SetTaskState(TaskId::Open, TaskState::Running);
+//
+//
+//    //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
+//       //DoGripServoOff_Compat(hWnd);
+//
+//       // 2) Close OFF
+//    ToggleDO_HW(9, false, hWnd);
+//    SetTaskState(TaskId::Close, TaskState::Idle);
+//
+//    // 3) Open 신호: 8번을 한번 OFF 했다가 ON (에지 만들기)
+//    ToggleDO_HW(8, false, hWnd);
+//    ToggleDO_HW(8, true, hWnd);   // 이 상태가 계속 유지 → Open 상태
+//
+//    //DoGripServoOff_Compat(hWnd);
+//}
 
+void Open(){
+    if (!g_commStarted) { SetTaskState(TaskId::Open, TaskState::Failed); return; }
+    StartAbsMoveWithProfile(0, -20, 20000, 100, 100);
 
-    //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
-       //DoGripServoOff_Compat(hWnd);
-
-       // 2) Close OFF
-    ToggleDO_HW(9, false, hWnd);
-    SetTaskState(TaskId::Close, TaskState::Idle);
-
-    // 3) Open 신호: 8번을 한번 OFF 했다가 ON (에지 만들기)
-    ToggleDO_HW(8, false, hWnd);
-    ToggleDO_HW(8, true, hWnd);   // 이 상태가 계속 유지 → Open 상태
-
-    //DoGripServoOff_Compat(hWnd);
 }
 
-void DoClose_Compat(HWND hWnd)
-{
-    // 그리퍼 Close 명령 시작
-    SetTaskState(TaskId::Close, TaskState::Running);
-
-    // 1) STO 펄스
-    //DoGripServoOff_Compat(hWnd);
-
-    // 2) Open OFF
-    ToggleDO_HW(8, false, hWnd);
-    SetTaskState(TaskId::Open, TaskState::Idle);
-
-    // 3) Close 신호: 9번을 한번 OFF 했다가 ON (에지 만들기)
-    ToggleDO_HW(9, false, hWnd);
-    ToggleDO_HW(9, true, hWnd);   // 이 상태 유지 → Close 상태
-    //DoGripServoOff_Compat(hWnd);
+void Close() {
+    if (!g_commStarted) { SetTaskState(TaskId::Close, TaskState::Failed); return; }
+    StartAbsMoveWithProfile(0, 48000, 20000, 100, 100);
 
 }
 
@@ -2077,15 +2136,46 @@ static void RunTempTask(TaskId id, int ms = 400)
         }).detach();
 }
 
-void Forward() { }
-void Backward() { }
-
-void Forking() { }
-void Unforking() { }
+void Forward();
+void Backward();
+void Forking() {
+    if (!g_commStarted) { SetTaskState(TaskId::Forking, TaskState::Failed); return; }
+    int ax = 1;
+    long long tgt = 65000;
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
+        20000.0, 100.0, 100.0,
+        10.0, 2.0, 30000,
+        1000, { 1000.0, 80.0, 10.0 });
+}
+void Unforking() {
+    if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+    int ax = 1;
+    long long tgt = -20;
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
+        20000.0, 100.0, 100.0,
+        10.0, 2.0, 30000,
+        1000, { 1000.0, 80.0, 10.0 });
+}
 
 // Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
-void Down() {}
-void Up() {}
+void Down(){
+    if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+    int ax = 2;
+    long long tgt = -20;
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
+        20000.0, 100.0, 100.0,
+        10.0, 2.0, 30000,
+        1000, { 1000.0, 80.0, 10.0 });
+}
+void Up(){
+    if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+    int ax = 2;
+    long long tgt = -20;
+    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
+        20000.0, 100.0, 100.0,
+        10.0, 2.0, 30000,
+        1000, { 1000.0, 80.0, 10.0 });
+}
 
 // Load 시퀀스: Conveyor → Workstation
 void StartDemoLoad()
@@ -2104,7 +2194,7 @@ void StartDemoLoad()
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
             HoistUp();
-            (void)WaitUntil(IsAxis2Up, 20000);
+            (void)WaitUntil(IsAxis4Up, 20000);
         }
 
         // 2) 그리퍼 상태 확인
@@ -2113,7 +2203,7 @@ void StartDemoLoad()
         if (gcode == 0x00) {
 
             // 2-1) 먼저 Close 쪽으로 정리
-            DoClose_Compat(g_hDemoWnd);
+            //DoClose_Compat(g_hDemoWnd);
             (void)WaitUntil(IsGripperClosedAndIdle, 5000);
 
             // 2-2) Close 상태에서 Servo OFF
@@ -2126,7 +2216,7 @@ void StartDemoLoad()
             else {
 
                 // 박스가 없다면 Open 상태로 정리
-                DoOpen_Compat(g_hDemoWnd);
+                //DoOpen_Compat(g_hDemoWnd);
                 (void)WaitUntil(IsGripperOpenAndIdle, 5000);
 
                 DoGripServoOff_Compat(g_hDemoWnd);
@@ -2162,13 +2252,13 @@ void StartDemoLoad()
         if (ok) {
             HoistDown();
             // 축2가 ConveyorDown 위치에 도달할 때까지 대기
-            if (!WaitUntil(IsAxis2Conveyordown, 20000))
+            if (!WaitUntil(IsAxis4Conveyordown, 20000))
                 ok = false;
         }
 
         // 2. 그리퍼 Close (박스 잡기)
         if (ok) {
-            DoClose_Compat(g_hDemoWnd);
+            //DoClose_Compat(g_hDemoWnd);
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
             if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
                 ok = false;
@@ -2177,7 +2267,7 @@ void StartDemoLoad()
         // 3. 축2 Up
         if (ok) {
             HoistUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
+            if (!WaitUntil(IsAxis4Up, 20000))
                 ok = false;
         }
 
@@ -2200,7 +2290,7 @@ void StartDemoUnload()
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
             HoistUp();
-            (void)WaitUntil(IsAxis2Up, 20000);
+            (void)WaitUntil(IsAxis4Up, 20000);
         }
 
         // 2) 그리퍼 상태 확인
@@ -2209,7 +2299,7 @@ void StartDemoUnload()
         if (gcode == 0x00) {
 
             // 2-1) 먼저 Close 쪽으로 정리
-            DoClose_Compat(g_hDemoWnd);
+            //DoClose_Compat(g_hDemoWnd);
             (void)WaitUntil(IsGripperClosedAndIdle, 5000);
 
             // 2-2) Close 상태에서 Servo OFF
@@ -2222,7 +2312,7 @@ void StartDemoUnload()
             else {
 
                 // 박스가 없다면 Open 상태로 정리
-                DoOpen_Compat(g_hDemoWnd);
+                //DoOpen_Compat(g_hDemoWnd);
                 (void)WaitUntil(IsGripperOpenAndIdle, 5000);
 
                 DoGripServoOff_Compat(g_hDemoWnd);
@@ -2259,13 +2349,13 @@ void StartDemoUnload()
         // 2. WorkDown (작업 위치로 하강)
         if (ok) {
             HoistDown();
-            if (!WaitUntil(IsAxis2Workdown, 20000))
+            if (!WaitUntil(IsAxis4Workdown, 20000))
                 ok = false;
         }
 
         // 3. 그리퍼 Open (박스 내려놓기)
         if (ok) {
-            DoOpen_Compat(g_hDemoWnd);
+            //DoOpen_Compat(g_hDemoWnd);
             // Unload 목적: "박스 내려놓고 더 이상 들고 있지 않음" → NoBox() 기준
             if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
                 ok = false;
@@ -2274,7 +2364,7 @@ void StartDemoUnload()
         // 4. 축2 Up
         if (ok) {
             HoistUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
+            if (!WaitUntil(IsAxis4Up, 20000))
                 ok = false;
         }
 
@@ -2317,14 +2407,531 @@ void StartAllDemo()
         }).detach();
 }
 
+// ======================================================
+// Added limit handling logic (AX0/AX1/AX2/AX3/AX5)
+//  - Preserves existing Axis2 sensor/home logic on axis index 4
+// ======================================================
+static inline void SetStaticText(HWND h, const std::wstring& s) {
+    if (h) SetWindowTextW(h, s.c_str());
+}
+static void UpdateAxLimitPanel(
+    bool ax0, bool ax1_1, bool ax1_2,
+    bool ax2_up, bool ax2_dn,
+    bool ax3_up, bool ax3_dn,
+    bool ax5_1, bool ax5_2, bool ax5_3, bool ax5_4)
+{
+    if (!g_hDemoWnd) return;
+
+    SetStaticText(g_hAxLimitStatics[0], std::wstring(L"AX0 LIMIT : ") + (ax0 ? L"ON" : L"OFF"));
+    SetStaticText(g_hAxLimitStatics[1], std::wstring(L"AX1 L1/L2 : ") + (ax1_1 ? L"1" : L"0") + L"/" + (ax1_2 ? L"1" : L"0"));
+    SetStaticText(g_hAxLimitStatics[2], std::wstring(L"AX2 UP/DN : ") + (ax2_up ? L"1" : L"0") + L"/" + (ax2_dn ? L"1" : L"0"));
+    SetStaticText(g_hAxLimitStatics[3], std::wstring(L"AX3 UP/DN : ") + (ax3_up ? L"1" : L"0") + L"/" + (ax3_dn ? L"1" : L"0"));
+    SetStaticText(g_hAxLimitStatics[4], L"AX4 : (kept - existing logic)"); // axis index 4 is used by existing Axis2 limit/home logic
+    SetStaticText(g_hAxLimitStatics[5], std::wstring(L"AX5 L1..L4 : ") + (ax5_1 ? L"1" : L"0") + (ax5_2 ? L"1" : L"0") + (ax5_3 ? L"1" : L"0") + (ax5_4 ? L"1" : L"0") + std::wstring(L"  ") + g_ax5UiExtra);
+}
+
+// ---------- AX0 ----------
+static bool  g_ax0LimitPrev = false;
+static DWORD g_ax0LimitOnTick = 0;
+static bool  g_ax0HomeIssued = false;
+
+// ---------- AX1 ----------
+static bool g_ax1StopHomeIssued = false;
+static bool g_ax1HomePending = false;
+static DWORD g_ax1HomeRequestTick = 0;
+static const DWORD AX1_HOME_DELAY_MS = 3000; // Stop 후 Home까지 딜레이
+
+
+// ---------- AX2/AX3 (just stop) ----------
+static bool g_ax2StopIssued = false;
+static bool g_ax3StopIssued = false;
+
+// ---------- AX5 state machine ----------
+enum class Ax5Side { Unknown, Left, Right, Center };
+enum class Ax5Dir { None, Plus, Minus };
+
+static Ax5Side g_ax5Side = Ax5Side::Unknown;
+static Ax5Side g_ax5ExpectedSide = Ax5Side::Unknown; // Expected destination side for current move
+static Ax5Side g_ax5SelectedSide = Ax5Side::Unknown; // Side chosen by last forward() for backward()
+static Ax5Side g_ax5LastNonCenterSide = Ax5Side::Unknown; // Remember last detected Left/Right when idle
+static Ax5Dir  g_ax5Dir = Ax5Dir::None;
+
+static bool g_ax5PrevL1 = false, g_ax5PrevL2 = false, g_ax5PrevL3 = false, g_ax5PrevL4 = false;
+static int  g_ax5PlusRiseCount = 0; // L1 (left-side) or L2 (right-side) rising count
+static bool g_ax5DecelIssued = false;
+static bool g_ax5StopIssued = false;
+
+// For "- direction from center" side inference
+static bool g_ax5FromCenter = false;
+static bool g_ax5SeenL1Off = false;
+static bool g_ax5SeenL2Off = false;
+
+
+// AX5 UI/status
+static bool g_ax5LastCheckOk = false;
+static std::wstring g_ax5LastCheckName = L"";
+static Ax5Dir GetAxisDirFromStatus(int axis) {
+    CoreMotionStatus st{}; g_cm.GetStatus(&st);
+    double vcmd = st.axesStatus[axis].velocityCmd;
+    const double th = 2.0;
+    if (vcmd > th) return Ax5Dir::Plus;
+    if (vcmd < -th) return Ax5Dir::Minus;
+    return Ax5Dir::None;
+}
+
+static void Ax5IssueDecel(int dirSign) {
+    if (g_ax5DecelIssued) return;
+    if (!g_commStarted) return;
+    if (!EnsureServoOn(5) || !EnsurePosModeNoStop(5)) return;
+
+    CoreMotionStatus st{}; g_cm.GetStatus(&st);
+    long long cur = (long long)st.axesStatus[5].actualPos;
+
+    Motion::PosCommand pc{};
+    pc.axis = 5;
+    pc.target = cur + (long long)dirSign * AX5_DECEL_LOOKAHEAD_PULSE;
+    pc.profile.type = ProfileType::SCurve;
+    pc.profile.velocity = (int)std::lround(AX5_DECEL_VEL_PPS);
+    pc.profile.acc = TimeMsToAcc(pc.profile.velocity, AX5_DECEL_ACC_MS);
+    pc.profile.dec = TimeMsToAcc(pc.profile.velocity, AX5_DECEL_DEC_MS);
+    g_cm.motion->StartPos(&pc);
+
+    g_ax5DecelIssued = true;
+}
+
+static void Ax5ResetState() {
+    g_ax5Side = Ax5Side::Unknown;
+    g_ax5Dir = Ax5Dir::None;
+    g_ax5PlusRiseCount = 0;
+    g_ax5DecelIssued = false;
+    g_ax5StopIssued = false;
+    g_ax5FromCenter = false;
+    g_ax5SeenL1Off = false;
+    g_ax5SeenL2Off = false;
+}
+// ---------- AX5 forward/backward helpers ----------
+static Ax5Side DetectAx5SideFromLimits(bool l1, bool l2, bool l3, bool l4)
+{
+    if (l1 && l2 && l3 && l4) return Ax5Side::Center;
+    if (!l1 && l2 && l3 && l4) return Ax5Side::Left;
+    if (l1 && !l2 && l3 && l4) return Ax5Side::Right;
+    return Ax5Side::Unknown;
+}
+
+static void ReadAx5Limits(bool& l1, bool& l2, bool& l3, bool& l4)
+{
+    l1 = ReadInputBitRaw(AX5_LIMIT1_ADDR, AX5_LIMIT1_BIT, AX5_LIMIT1_ACTIVE_HIGH);
+    l2 = ReadInputBitRaw(AX5_LIMIT2_ADDR, AX5_LIMIT2_BIT, AX5_LIMIT2_ACTIVE_HIGH);
+    l3 = ReadInputBitRaw(AX5_LIMIT3_ADDR, AX5_LIMIT3_BIT, AX5_LIMIT3_ACTIVE_HIGH);
+    l4 = ReadInputBitRaw(AX5_LIMIT4_ADDR, AX5_LIMIT4_BIT, AX5_LIMIT4_ACTIVE_HIGH);
+}
+
+static void SyncAx5PrevLimitsToCurrent()
+{
+    bool l1, l2, l3, l4;
+    ReadAx5Limits(l1, l2, l3, l4);
+    g_ax5PrevL1 = l1; g_ax5PrevL2 = l2; g_ax5PrevL3 = l3; g_ax5PrevL4 = l4;
+}
+
+// Travel settings for AX5 "search move" (state machine will decel/stop by limits)
+static const long long AX5_FORWARD_TRAVEL_PULSE = 8000000;  // + direction long move
+static const long long AX5_BACKWARD_TRAVEL_PULSE = 8000000; // - direction long move
+static const double    AX5_CRUISE_VEL_PPS = 4000.0;
+static const double    AX5_CRUISE_ACC_MS = 200.0;
+static const double    AX5_CRUISE_DEC_MS = 200.0;
+
+static void StartAx5LongMove(int dirSign)
+{
+    if (!g_commStarted) return;
+    if (!EnsureServoOn(5) || !EnsurePosModeNoStop(5)) return;
+
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+    long long cur = (long long)st.axesStatus[5].actualPos;
+    long long tgt = cur + (dirSign > 0 ? AX5_FORWARD_TRAVEL_PULSE : -AX5_BACKWARD_TRAVEL_PULSE);
+
+    StartAbsMoveWithProfile(5, tgt, AX5_CRUISE_VEL_PPS, AX5_CRUISE_ACC_MS, AX5_CRUISE_DEC_MS);
+}
+
+// ===== Public-style motion entry points =====
+// forward(): AX5 +방향 동작. 시작 시 Left/Right 패턴을 보고 g_ax5ExpectedSide 설정 후 긴 +이동을 시작.
+// backward(): AX5 -방향 동작. 시작은 Center(1,2,3,4 ON)에서, 직전(또는 기대) Left/Right를 기준으로 -이동을 시작.
+void Forward()
+{
+    bool l1, l2, l3, l4;
+    ReadAx5Limits(l1, l2, l3, l4);
+    Ax5Side side = DetectAx5SideFromLimits(l1, l2, l3, l4);
+
+    // forward: +방향 이동. 시작 위치가 Left 또는 Right인지 판단해서 그에 맞는 시퀀스로 센터에 접근한다.
+    if (side != Ax5Side::Left && side != Ax5Side::Right) {
+        g_ax5UiExtra = L"Side=Center/Unknown  Forward blocked";
+        return;
+    }
+
+    // Store side for backward()
+    g_ax5SelectedSide = side;
+    g_ax5LastNonCenterSide = side; // also remember
+
+    // Reset one-shot flags
+    g_ax5ExpectedSide = Ax5Side::Unknown; // +방향에서는 -방향 기대치가 필요 없음
+    g_ax5Side = side;
+    g_ax5DecelIssued = false;
+    g_ax5StopIssued = false;
+    g_ax5SeenL1Off = false;
+    g_ax5SeenL2Off = false;
+    g_ax5FromCenter = false;
+
+    g_ax5LastCheckName.clear();
+    g_ax5LastCheckOk = false;
+
+    // Avoid false edges on first timer tick after starting motion
+    SyncAx5PrevLimitsToCurrent();
+
+    StartAx5LongMove(+1);
+}
+
+void Backward()
+{
+    bool l1, l2, l3, l4;
+    ReadAx5Limits(l1, l2, l3, l4);
+    Ax5Side sideNow = DetectAx5SideFromLimits(l1, l2, l3, l4);
+
+    // backward: -방향 이동. 센터(1,2,3,4 ON)에서 출발한다고 가정.
+    if (sideNow != Ax5Side::Center) {
+        g_ax5UiExtra = L"Side!=Center  Backward blocked";
+        return;
+    }
+
+    // Prefer the side decided by forward(). If none, fall back to last non-center observation.
+    Ax5Side expect = Ax5Side::Unknown;
+    if (g_ax5SelectedSide == Ax5Side::Left || g_ax5SelectedSide == Ax5Side::Right) {
+        expect = g_ax5SelectedSide;
+    }
+    else if (g_ax5LastNonCenterSide == Ax5Side::Left || g_ax5LastNonCenterSide == Ax5Side::Right) {
+        expect = g_ax5LastNonCenterSide;
+    }
+    else {
+        // default fallback
+        expect = Ax5Side::Left;
+    }
+
+    g_ax5ExpectedSide = expect;
+    g_ax5Side = Ax5Side::Center;
+
+    g_ax5DecelIssued = false;
+    g_ax5StopIssued = false;
+    g_ax5SeenL1Off = false;
+    g_ax5SeenL2Off = false;
+    g_ax5FromCenter = true;
+
+    g_ax5LastCheckName.clear();
+    g_ax5LastCheckOk = false;
+
+    SyncAx5PrevLimitsToCurrent();
+
+    StartAx5LongMove(-1);
+}
+
+
+// Call this periodically (timer)
+static void AxLimitSensorTimerProc(HWND)
+{
+    if (!g_commStarted) {
+        return;
+    }
+
+    // Read all requested inputs (active-high mapping)
+    bool ax0 = ReadInputBitRaw(AX0_LIMIT_ADDR, AX0_LIMIT_BIT, AX0_LIMIT_ACTIVE_HIGH);
+
+    bool ax1_1 = ReadInputBitRaw(AX1_LIMIT1_ADDR, AX1_LIMIT1_BIT, AX1_LIMIT1_ACTIVE_HIGH);
+    bool ax1_2 = ReadInputBitRaw(AX1_LIMIT2_ADDR, AX1_LIMIT2_BIT, AX1_LIMIT2_ACTIVE_HIGH);
+
+    bool ax2_up = ReadInputBitRaw(AX2_UPLIMIT_ADDR, AX2_UPLIMIT_BIT, AX2_UPLIMIT_ACTIVE_HIGH);
+    bool ax2_dn = ReadInputBitRaw(AX2_DOWNLIMIT_ADDR, AX2_DOWNLIMIT_BIT, AX2_DOWNLIMIT_ACTIVE_HIGH);
+
+    bool ax3_up = ReadInputBitRaw(AX3_UPLIMIT_ADDR, AX3_UPLIMIT_BIT, AX3_UPLIMIT_ACTIVE_HIGH);
+    bool ax3_dn = ReadInputBitRaw(AX3_DOWNLIMIT_ADDR, AX3_DOWNLIMIT_BIT, AX3_DOWNLIMIT_ACTIVE_HIGH);
+
+    bool l1 = ReadInputBitRaw(AX5_LIMIT1_ADDR, AX5_LIMIT1_BIT, AX5_LIMIT1_ACTIVE_HIGH);
+    bool l2 = ReadInputBitRaw(AX5_LIMIT2_ADDR, AX5_LIMIT2_BIT, AX5_LIMIT2_ACTIVE_HIGH);
+    bool l3 = ReadInputBitRaw(AX5_LIMIT3_ADDR, AX5_LIMIT3_BIT, AX5_LIMIT3_ACTIVE_HIGH);
+    bool l4 = ReadInputBitRaw(AX5_LIMIT4_ADDR, AX5_LIMIT4_BIT, AX5_LIMIT4_ACTIVE_HIGH);
+
+    UpdateAxLimitPanel(ax0, ax1_1, ax1_2, ax2_up, ax2_dn, ax3_up, ax3_dn, l1, l2, l3, l4);
+
+    DWORD now = GetTickCount();
+
+    // ---------------- AX0: stop only on the FIRST ON (rising edge), allow motion while held ON; home if held ON & idle >= 1s ----------------
+    {
+        CoreMotionStatus st0{};
+        g_cm.GetStatus(&st0);
+        const double vcmd0 = st0.axesStatus[0].velocityCmd;
+        const double vth = 2.0; // pps threshold to treat as moving
+        const bool isMoving = (vcmd0 > vth) || (vcmd0 < -vth);
+
+        if (ax0) {
+            // Stop ONLY when the limit first turns ON (rising edge).
+            if (!g_ax0LimitPrev) {
+                StopAxis(0);
+                g_ax0LimitOnTick = now;   // start hold timer for home
+                g_ax0HomeIssued = false;
+            }
+
+            // While the limit stays ON, DO NOT keep stopping.
+            // Home trigger: only if the limit stays ON for >= hold time while the axis is idle.
+            if (isMoving) {
+                // operator is jogging / axis is moving -> don't count toward auto-home
+                g_ax0LimitOnTick = now;
+            }
+            else {
+                if (!g_ax0HomeIssued && g_ax0LimitOnTick != 0 && (now - g_ax0LimitOnTick) >= AX0_LIMIT_HOME_HOLD_MS) {
+                    if (EnsureServoOn(0) && EnsurePosModeNoStop(0)) {
+                        g_home.StartHome(0);
+                        g_ax0HomeIssued = true;
+                    }
+                }
+            }
+        }
+        else {
+            g_ax0LimitOnTick = 0;
+            g_ax0HomeIssued = false;
+        }
+
+        g_ax0LimitPrev = ax0;
+    }
+
+    // ---------------- AX1: if BOTH OFF -> stop + (delayed) home ----------------
+    if (!ax1_1 && !ax1_2) {
+
+        // 1) 조건 처음 진입 시 Stop + Home Pending
+        if (!g_ax1StopHomeIssued) {
+            StopAxis(1);
+            g_ax1HomePending = true;
+            g_ax1HomeRequestTick = GetTickCount();
+            g_ax1StopHomeIssued = true;
+        }
+
+        // 2) Stop 후 일정 시간 지나면 Home 시도 (매틱 반복 호출 방지)
+        if (g_ax1HomePending) {
+            DWORD now = GetTickCount();
+            if (now - g_ax1HomeRequestTick >= AX1_HOME_DELAY_MS) {
+                if (EnsureServoOn(1) && EnsurePosModeNoStop(1)) {
+                    g_home.StartHome(1);
+                }
+                // Home 시도는 일단 1번만 하고 pending 해제
+                // (만약 실패 재시도 원하면, 홈 상태 체크해서 실패면 다시 pending=true로 올리면 됨)
+                g_ax1HomePending = false;
+            }
+        }
+
+    }
+    else {
+        // 조건 해제 시 리셋
+        g_ax1StopHomeIssued = false;
+        g_ax1HomePending = false;
+    }
+
+
+    // ---------------- AX2: if UP or DOWN ON -> stop ----------------
+    if (ax2_up || ax2_dn) {
+        if (!g_ax2StopIssued) {
+            StopAxis(2);
+            g_ax2StopIssued = true;
+        }
+    }
+    else {
+        g_ax2StopIssued = false;
+    }
+
+    // ---------------- AX3: if UP or DOWN ON -> stop ----------------
+    if (ax3_up || ax3_dn) {
+        if (!g_ax3StopIssued) {
+            StopAxis(3);
+            g_ax3StopIssued = true;
+        }
+    }
+    else {
+        g_ax3StopIssued = false;
+    }
+
+
+    // ---------------- AX5: special behavior (updated per latest spec) ----------------
+    // Side identification at start/rest:
+    //   Left  : L2,L3,L4 ON  (and L1 OFF)
+    //   Right : L1,L3,L4 ON  (and L2 OFF)
+    //   Center: L1,L2,L3,L4 ON
+    bool isCenter = (l1 && l2 && l3 && l4);
+    bool isLeft = (!l1 && l2 && l3 && l4);
+    bool isRight = (l1 && !l2 && l3 && l4);
+
+    bool l1Rise = (!g_ax5PrevL1 && l1);
+    bool l2Rise = (!g_ax5PrevL2 && l2);
+    bool l3Rise = (!g_ax5PrevL3 && l3);
+    bool l4Rise = (!g_ax5PrevL4 && l4);
+    bool l1Fall = (g_ax5PrevL1 && !l1);
+    bool l2Fall = (g_ax5PrevL2 && !l2);
+
+    Ax5Dir dir = GetAxisDirFromStatus(5);
+
+    // Reset one-shot flags when direction changes
+    if (dir != g_ax5Dir) {
+        g_ax5Dir = dir;
+        g_ax5DecelIssued = false;
+        g_ax5StopIssued = false;
+        g_ax5FromCenter = isCenter;
+        g_ax5SeenL1Off = false;
+        g_ax5SeenL2Off = false;
+    }
+
+    // Update side when idle (start/settled)
+    if (dir == Ax5Dir::None) {
+        if (isCenter) {
+            g_ax5Side = Ax5Side::Center;
+            g_ax5ExpectedSide = Ax5Side::Unknown; // clear expectation when settled
+        }
+        else if (isLeft) {
+            g_ax5Side = Ax5Side::Left;
+            g_ax5LastNonCenterSide = Ax5Side::Left;
+        }
+        else if (isRight) {
+            g_ax5Side = Ax5Side::Right;
+            g_ax5LastNonCenterSide = Ax5Side::Right;
+        }
+    }
+    else {
+        // If side is unknown, try to infer from current pattern during motion
+        if (g_ax5Side == Ax5Side::Unknown) {
+            if (isLeft)  g_ax5Side = Ax5Side::Left;
+            else if (isRight) g_ax5Side = Ax5Side::Right;
+            else if (isCenter) g_ax5Side = Ax5Side::Center;
+        }
+
+        // ---- + direction ----
+        if (dir == Ax5Dir::Plus) {
+            if (g_ax5StopIssued) {
+                // mismatch detected or already stopped
+            }
+            else if (g_ax5Side == Ax5Side::Left) {
+                // + from Left: decel when L4 becomes ON, stop when L1 becomes ON, then check ALL ON
+                if (!g_ax5DecelIssued && (l4 || l4Rise)) Ax5IssueDecel(+1);
+                if (!g_ax5StopIssued && (l1 || l1Rise)) {
+                    StopAxis(5);
+                    g_ax5StopIssued = true;
+
+                    g_ax5LastCheckName = L"124";
+                    g_ax5LastCheckOk = (l1 && l2 && l4);
+                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Center;
+                }
+            }
+            else if (g_ax5Side == Ax5Side::Right) {
+                // + from Right: decel when L3 becomes ON, stop when L2 becomes ON, then check ALL ON
+                if (!g_ax5DecelIssued && (l3 || l3Rise)) Ax5IssueDecel(+1);
+                if (!g_ax5StopIssued && (l2 || l2Rise)) {
+                    StopAxis(5);
+                    g_ax5StopIssued = true;
+
+                    g_ax5LastCheckName = L"123";
+                    g_ax5LastCheckOk = (l1 && l2 && l3);
+                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Center;
+                }
+            }
+        }
+
+        // ---- - direction ----
+        if (dir == Ax5Dir::Minus) {
+            // -방향은 Center(1,2,3,4 ON)에서 Left 또는 Right로 빠져나가는 동작.
+            // backward()가 기대 방향을 지정한 경우(g_ax5ExpectedSide), 그쪽 분기만 사용한다.
+            if (g_ax5ExpectedSide != Ax5Side::Unknown && g_ax5Side == Ax5Side::Center) {
+                g_ax5Side = g_ax5ExpectedSide;
+            }
+
+            // 기대 방향이 없을 때만, 먼저 OFF가 되는 센서로 방향을 추정한다.
+            if (g_ax5ExpectedSide == Ax5Side::Unknown) {
+                //   L1 OFF => Left
+                //   L2 OFF => Right
+                if (!g_ax5SeenL1Off && l1Fall) { g_ax5Side = Ax5Side::Left;  g_ax5SeenL1Off = true; }
+                if (!g_ax5SeenL2Off && l2Fall) { g_ax5Side = Ax5Side::Right; g_ax5SeenL2Off = true; }
+            }
+            else {
+                // forward()에서 정해진 기대 방향(g_ax5ExpectedSide)이 맞는지 확인:
+                //  - expect Left  : L1이 먼저 OFF 되어야 함 (L2가 먼저 OFF면 mismatch)
+                //  - expect Right : L2가 먼저 OFF 되어야 함 (L1이 먼저 OFF면 mismatch)
+                if (!g_ax5SeenL1Off && l1Fall) g_ax5SeenL1Off = true;
+                if (!g_ax5SeenL2Off && l2Fall) g_ax5SeenL2Off = true;
+
+                if (!g_ax5StopIssued) {
+                    if (g_ax5ExpectedSide == Ax5Side::Left && l2Fall && !g_ax5SeenL1Off) {
+                        StopAxis(5);
+                        g_ax5StopIssued = true;
+                        g_ax5LastCheckName = L"DIR";
+                        g_ax5LastCheckOk = false;
+                        g_ax5UiExtra = L"SideMismatch: expected Left but L2 fell first";
+                    }
+                    else if (g_ax5ExpectedSide == Ax5Side::Right && l1Fall && !g_ax5SeenL2Off) {
+                        StopAxis(5);
+                        g_ax5StopIssued = true;
+                        g_ax5LastCheckName = L"DIR";
+                        g_ax5LastCheckOk = false;
+                        g_ax5UiExtra = L"SideMismatch: expected Right but L1 fell first";
+                    }
+                }
+            }
+
+            if (g_ax5Side == Ax5Side::Left) {
+                // - toward Left: decel when L3 becomes ON, stop when L4 becomes ON, then check 2,3,4 ON
+                if (!g_ax5DecelIssued && !g_ax5StopIssued && (l3 || l3Rise)) Ax5IssueDecel(-1);
+                if (!g_ax5StopIssued && (l4 || l4Rise)) {
+                    StopAxis(5);
+                    g_ax5StopIssued = true;
+
+                    g_ax5LastCheckName = L"234";
+                    g_ax5LastCheckOk = (l2 && l3 && l4);
+                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Left;
+                }
+            }
+            else if (g_ax5Side == Ax5Side::Right) {
+                // - toward Right: decel when L4 becomes ON, stop when L3 becomes ON, then check 1,3,4 ON
+                if (!g_ax5DecelIssued && !g_ax5StopIssued && (l4 || l4Rise)) Ax5IssueDecel(-1);
+                if (!g_ax5StopIssued && (l3 || l3Rise)) {
+                    StopAxis(5);
+                    g_ax5StopIssued = true;
+
+                    g_ax5LastCheckName = L"134";
+                    g_ax5LastCheckOk = (l1 && l3 && l4);
+                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Right;
+                }
+            }
+        }
+    }
+
+    // Build AX5 UI status string
+    const wchar_t* sideStr = L"Unknown";
+    switch (g_ax5Side) {
+    case Ax5Side::Left:   sideStr = L"Left"; break;
+    case Ax5Side::Right:  sideStr = L"Right"; break;
+    case Ax5Side::Center: sideStr = L"Center"; break;
+    default: break;
+    }
+
+    g_ax5UiExtra = std::wstring(L"Side=") + sideStr;
+    if (!g_ax5LastCheckName.empty()) {
+        g_ax5UiExtra += std::wstring(L"  Check=") + g_ax5LastCheckName + (g_ax5LastCheckOk ? L" OK" : L" NG");
+    }
+
+    // Update demo panel after logic
+    UpdateAxLimitPanel(ax0, ax1_1, ax1_2, ax2_up, ax2_dn, ax3_up, ax3_dn, l1, l2, l3, l4);
+    g_ax5PrevL1 = l1; g_ax5PrevL2 = l2; g_ax5PrevL3 = l3; g_ax5PrevL4 = l4;
+}
+
 // =======================================
 // UI 배치
 // 좌측: GPIO 제어/표시(토글/라벨)
 // 우측: Demo 버튼/상태/센서
 // =======================================
 enum : UINT_PTR {
-    IDT_AX2_SENSOR_POLL = 0x2001,
-    IDT_GPIO_REFRESH = 0x2002
+    IDT_AX4_SENSOR_POLL = 0x2001,
+    IDT_GPIO_REFRESH = 0x2002,
+    IDT_AX_LIMIT_POLL = 0x2003
 };
 enum : int {
     // Right-panel buttons
@@ -2430,6 +3037,36 @@ static void CreateLeftGPIOUI(HWND h, HINSTANCE hInst, int x, int y, int w, int h
         SendMessage(hSw, WM_SETFONT, (WPARAM)hText, TRUE);
         g_swDO[i] = hSw;
     }
+    // -------------------------------------------------------
+    // Added: AX0~AX5 limit sensor readout (left side)
+    // -------------------------------------------------------
+    {
+        int ySensors = yBase + rowH * 2 + 12;
+        int hSensors = std::max(120, (y + hgt) - ySensors - 12);
+        if (hSensors > 210) hSensors = 210;
+
+        CreateWindow(TEXT("BUTTON"), TEXT("AX Limit Sensors"),
+            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+            x + 10, ySensors, w - 20, hSensors, h, 0, 0, 0);
+
+        int sx = x + 24;
+        int sy = ySensors + 28;
+        int lineH = 20;
+
+        // 6 compact lines
+        for (int i = 0; i < 6; ++i) {
+            g_hAxLimitStatics[i] = CreateWindowEx(0, _T("STATIC"), _T(""),
+                WS_CHILD | WS_VISIBLE, sx, sy + i * (lineH + 6), w - 48, lineH, h, 0, hInst, 0);
+            SendMessage(g_hAxLimitStatics[i], WM_SETFONT, (WPARAM)hText, TRUE);
+        }
+        // Initialize text
+        SetWindowText(g_hAxLimitStatics[0], _T("AX0 LIMIT : --"));
+        SetWindowText(g_hAxLimitStatics[1], _T("AX1 L1/L2 : --/--"));
+        SetWindowText(g_hAxLimitStatics[2], _T("AX2 UP/DN : --/--"));
+        SetWindowText(g_hAxLimitStatics[3], _T("AX3 UP/DN : --/--"));
+        SetWindowText(g_hAxLimitStatics[4], _T("AX4 : (kept - existing logic)"));
+        SetWindowText(g_hAxLimitStatics[5], _T("AX5 L1..L4 : ----"));
+    }
 
     DeleteObject(hTitle);
     DeleteObject(hText);
@@ -2488,9 +3125,9 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
         auto [bx, by] = addGroup(TEXT("본체 업다운"), grpH);
 
         int btnW = (w - padX * 2 - 10) / 2;
-        CreateWindow(TEXT("BUTTON"), TEXT("Up"), WS_CHILD | WS_VISIBLE,
+        CreateWindow(TEXT("BUTTON"), TEXT("Up(Main)"), WS_CHILD | WS_VISIBLE,
             bx, by, btnW, btnH, h, (HMENU)ID_BTN_UP, 0, 0);
-        CreateWindow(TEXT("BUTTON"), TEXT("Down"), WS_CHILD | WS_VISIBLE,
+        CreateWindow(TEXT("BUTTON"), TEXT("Down(Side)"), WS_CHILD | WS_VISIBLE,
             bx + btnW + 10, by, btnW, btnH, h, (HMENU)ID_BTN_DOWN, 0, 0);
 
         yCursor += grpH + gapY;
@@ -2632,8 +3269,10 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         CreateRightDemoUI(hWnd, rightX, margin, rightW, totalH - margin * 2);
 
         // 타이머 시작
-        SetTimer(hWnd, IDT_AX2_SENSOR_POLL, AX2_SENSOR_POLL_MS, nullptr);
+        SetTimer(hWnd, IDT_AX4_SENSOR_POLL, AX4_SENSOR_POLL_MS, nullptr);
         SetTimer(hWnd, IDT_GPIO_REFRESH, kPollIntervalMs, nullptr);
+
+        SetTimer(hWnd, IDT_AX_LIMIT_POLL, AX_LIMIT_POLL_MS, nullptr);
 
         // 창이 열릴 때 STO 펄스 1회 (오류 클리어)
         DoGripServoOff_Compat(hWnd);
@@ -2689,8 +3328,8 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
         case ID_BTN_FORKING:         Forking();          return 0;
         case ID_BTN_UNFORKING:       Unforking();        return 0;
-        case ID_BTN_OPEN:            DoOpen_Compat(g_hDemoWnd);  return 0;
-        case ID_BTN_CLOSE:           DoClose_Compat(g_hDemoWnd); return 0;
+        case ID_BTN_OPEN:            Open();  return 0;
+        case ID_BTN_CLOSE:           Close(); return 0;
 
         case ID_BTN_HOIST_UP:        HoistUp();          return 0;
         case ID_BTN_HOIST_DOWN:      HoistDown();        return 0;
@@ -2705,8 +3344,12 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         break;
     }
     case WM_TIMER:
-        if (wParam == IDT_AX2_SENSOR_POLL) {
+        if (wParam == IDT_AX4_SENSOR_POLL) {
             Axis2SensorTimerProc(hWnd);
+            return 0;
+        }
+        else if (wParam == IDT_AX_LIMIT_POLL) {
+            AxLimitSensorTimerProc(hWnd);
             return 0;
         }
         else if (wParam == IDT_GPIO_REFRESH) {
@@ -2748,8 +3391,9 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         break;
 
     case WM_DESTROY:
-        KillTimer(hWnd, IDT_AX2_SENSOR_POLL);
+        KillTimer(hWnd, IDT_AX4_SENSOR_POLL);
         KillTimer(hWnd, IDT_GPIO_REFRESH);
+        KillTimer(hWnd, IDT_AX_LIMIT_POLL);
         //PostQuitMessage(0);
         return 0;
     }

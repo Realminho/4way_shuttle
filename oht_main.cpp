@@ -77,8 +77,8 @@ extern void GoWorkstation();  // Workstation 버튼이 눌렸을 때 실행되�
 extern void HoistDown();    // Conveyor Down 버튼
 extern void Down();        // Work Down 버튼
 extern void Up();            // Up 버튼
-extern void DoClose_Compat(HWND hWnd); // Close 버튼
-extern void DoOpen_Compat(HWND hWnd); // Open 버튼
+//extern void DoClose_Compat(HWND hWnd); // Close 버튼
+//extern void DoOpen_Compat(HWND hWnd); // Open 버튼
 extern void DoStopAll(HWND hWnd); // Stop All 버튼
 extern bool IsGripperOpen(); // 그립퍼 열림 상태 외부 참조
 extern bool IsGripperOpenAndIdle(); // 그립퍼 열림 상태 외부 참조
@@ -2266,7 +2266,7 @@ void TcpServerThreadProc()
 
 
 						ToggleDO_HW(11, motioning, nullptr);
-						DoOpen_Compat(nullptr);
+						//DoOpen_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
 
@@ -2288,7 +2288,7 @@ void TcpServerThreadProc()
 
 
 						ToggleDO_HW(11, motioning, nullptr);
-						DoClose_Compat(nullptr);
+						//DoClose_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
 						g_gripBusy = false;
@@ -2344,7 +2344,7 @@ void TcpServerThreadProc()
 					if (gcode == 0x00) {
 						// 2-1) 먼저 Close 쪽으로 정리
 						AppendLog(L"[ACT] DriveReady: Grip ambiguous -> Close then ServoOff");
-						DoClose_Compat(g_hDemoWnd);
+						//DoClose_Compat(g_hDemoWnd);
 						(void)WaitUntil(IsGripperClosedAndIdle, 5000);
 
 						// 2-2) Close 상태에서 Servo OFF
@@ -2358,7 +2358,7 @@ void TcpServerThreadProc()
 						else {
 							// 박스가 없다면 Open 상태로 정리
 							AppendLog(L"[ACT] DriveReady: HasBox()==false -> Open then ServoOff");
-							DoOpen_Compat(g_hDemoWnd);
+							//DoOpen_Compat(g_hDemoWnd);
 							(void)WaitUntil(IsGripperOpenAndIdle, 5000);
 							//DoGripServoOff_Compat(g_hDemoWnd);
 						}
@@ -2376,7 +2376,7 @@ void TcpServerThreadProc()
 					if (hcode != 0x03) {
 						AppendLog(L"[ACT] DriveReady: Hoist not UP(0x03) -> DoUp()");
 						Up();
-						(void)WaitUntil(IsAxis2Up, 20000);
+						(void)WaitUntil(IsAxis4Up, 20000);
 					}
 					else {
 						AppendLog(L"[ACT] DriveReady: Hoist already UP(0x03)");

@@ -31,9 +31,9 @@ void StopAxis(int axis);
 
 bool IsAxis0AtConveyorBarcode();
 bool IsAxis0AtWorkstationBarcode();
-bool IsAxis2Up();
-bool IsAxis2Workdown();
-bool IsAxis2Conveyordown();
+bool IsAxis4Up();
+bool IsAxis4Workdown();
+bool IsAxis4Conveyordown();
 bool IsGripperOpen();
 bool IsGripperOpenAndIdle();
 bool IsGripperClosed();
@@ -42,8 +42,8 @@ bool HasBox();
 bool NoBox();
 
 
-void DoClose_Compat(HWND hWnd);
-void DoOpen_Compat(HWND hWnd);
+//void DoClose_Compat(HWND hWnd);
+//void DoOpen_Compat(HWND hWnd);
 void DoStopAll(HWND hWnd);
 
 void StartDemoHomeWithBox();
