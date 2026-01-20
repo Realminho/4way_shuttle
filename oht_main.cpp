@@ -421,7 +421,7 @@ static bool ReadInputBit(int addr, int bit, bool activeHigh) {
 	return activeHigh ? onRaw : !onRaw;
 }
 
-static bool WriteOutputBit(int addr, int bit, bool onLogical, bool activeHigh)
+bool WriteOutputBit(int addr, int bit, bool onLogical, bool activeHigh)
 {
 	if (!g_commStarted) return false;
 
@@ -1446,7 +1446,10 @@ static bool StartComm() {
 	g_ax2HomeLastTick = GetTickCount();
 	g_ax2HomeRampIssued = false;
 
-	WriteOutputBit(36, 0, true, true);
+	WriteOutputBit(36, 0, true, true); //바코드
+	WriteOutputBit(38, 0, true, true); //로딩 완료 led
+	WriteOutputBit(38, 3, true, true); //Blue led
+	WriteOutputBit(38, 4, true, true); //Pink led
 
 	return true;
 }

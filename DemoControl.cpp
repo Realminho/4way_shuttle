@@ -29,6 +29,7 @@ extern bool EnsurePosModeNoStop(int axis);
 extern int  TimeMsToAcc(double vel_cnt_per_s, double t_ms);
 extern bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAcc, double tDec);
 extern void StopAxis(int axis);
+extern bool WriteOutputBit(int addr, int bit, bool onLogical, bool activeHigh);
 
 // ========== EtherCAT 0x6063 읽기 ==========
 extern bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
@@ -120,6 +121,9 @@ TaskState GetTaskState(TaskId id) {
     return g_taskStatus[(int)id].state.load();
 }
 
+// LED manager hook (implemented later)
+void LedOnTaskStateChanged(HWND hWnd, TaskId tid, TaskState st);
+
 // =======================================
 // 공통 UI 유틸
 // =======================================
@@ -151,6 +155,9 @@ void SetTaskState(TaskId id, TaskState st) {
         std::wstring text = std::wstring(TaskName(id)) + L": " + TaskStateStr(st);
         SetWindowTextW(g_hStatusStatics[idx], text.c_str());
     }
+
+    // If this task owns the common action LED, finalize/cancel blink based on state.
+    LedOnTaskStateChanged(g_hDemoWnd, id, st);
 }
 void ResetAllTaskStates() {
     for (int i = 0; i < (int)TaskId::COUNT; ++i)
@@ -871,7 +878,11 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
             ::Sleep(10);
         }
 
-        SetTaskState(task, result);
+        // If another part of the system (e.g., limit-sensor stop) already marked this task as Done,
+        // don't overwrite it with Stopped/Failed.
+        if (GetTaskState(task) != TaskState::Done) {
+            SetTaskState(task, result);
+        }
         }).detach();
 }
 
@@ -1107,6 +1118,12 @@ void Axis2SensorTimerProc(HWND)
                 g_ax2HomingStarted = false;
             }
             Axis2HandleLimitOnceAndHome();
+
+            // 요구사항: HoistUp은 AX4 리밋센서에 닿아 멈추면 완료로 처리
+            TaskState hu = GetTaskState(TaskId::HoistUp);
+            if (Axis2IsIdle() && (hu == TaskState::Running || hu == TaskState::Stopped)) {
+                SetTaskState(TaskId::HoistUp, TaskState::Done);
+            }
         }
         else {
             g_ax2LimitBlocking = false;
@@ -1711,7 +1728,7 @@ bool IsAxisRight()
 bool IsAxisWorkstation()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc =1457;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 1457;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1798,7 +1815,7 @@ bool IsAxis4Conveyordown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 51600;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 68000;       // HoistDown() target (요구사항)
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -2028,7 +2045,8 @@ static bool CheckDemoUnloadPreconditions()
 
     return true;
 }
-
+void LedStartBlinkForTask(HWND hWnd, TaskId tid);
+void LedCancel(HWND hWnd);
 void DoGripServoOff_Compat(HWND hWnd) {};
 
 
@@ -2055,16 +2073,77 @@ void DoGripServoOff_Compat(HWND hWnd) {};
 //    //DoGripServoOff_Compat(hWnd);
 //}
 
-void Open(){
+// =======================================
+// Open/Close: Axis0 move + 완료 판정(타겟 위치에 정지)
+//  - 동작 시작: TaskState=Running + LED Blink
+//  - 완료 조건: Axis0 actualPos가 target 근처 + actualVelocity ~ 0
+// =======================================
+static void StartAxis0MoveDoneMonitor(TaskId tid, long long targetPos,
+    long long posEps = 10, double velEps = 1.0,
+    DWORD timeoutMs = 15000, DWORD pollMs = 20)
+{
+    std::thread([=]() {
+        DWORD start = GetTickCount();
+        while (true) {
+            TaskState st = GetTaskState(tid);
+            if (st == TaskState::Done || st == TaskState::Failed || st == TaskState::Stopped || st == TaskState::Idle)
+                return;
+
+            if (!g_commStarted) {
+                SetTaskState(tid, TaskState::Failed);
+                return;
+            }
+
+            CoreMotionStatus ms{};
+            g_cm.GetStatus(&ms);
+            const auto& ax = ms.axesStatus[0];
+
+            long long perr = (long long)ax.actualPos - targetPos;
+            double v = std::fabs(ax.actualVelocity);
+
+            if (std::llabs(perr) <= posEps && v <= velEps) {
+                SetTaskState(tid, TaskState::Done);
+                return;
+            }
+
+            if (GetTickCount() - start > timeoutMs) {
+                // 타임아웃 시, 아직 Running이면 Failed로
+                if (GetTaskState(tid) == TaskState::Running)
+                    SetTaskState(tid, TaskState::Failed);
+                return;
+            }
+
+            ::Sleep(pollMs);
+        }
+        }).detach();
+}
+
+void Open() {
     if (!g_commStarted) { SetTaskState(TaskId::Open, TaskState::Failed); return; }
+
+    // 상태/LED
+    SetTaskState(TaskId::Open, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Open);
+
+    // Move (OPEN은 타겟 도달이 아니라 AX0 리밋센서로 Stop될 때 완료)
     StartAbsMoveWithProfile(0, -20, 20000, 100, 100);
 
+    // 완료 판정은 AxLimitSensorTimerProc()의 AX0 limit stop 로직에서 수행
 }
 
 void Close() {
     if (!g_commStarted) { SetTaskState(TaskId::Close, TaskState::Failed); return; }
-    StartAbsMoveWithProfile(0, 50600, 20000, 100, 100);
 
+    // 상태/LED
+    SetTaskState(TaskId::Close, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Close);
+
+    // Move
+    const long long tgt = 50600;
+    StartAbsMoveWithProfile(0, tgt, 20000, 100, 100);
+
+    // 완료 감시
+    StartAxis0MoveDoneMonitor(TaskId::Close, tgt);
 }
 
 //void DoGripServoOff_Compat(HWND hWnd) {
@@ -2077,6 +2156,10 @@ void Close() {
 
 void HoistDown() {
     if (!g_commStarted) { SetTaskState(TaskId::HoistDown, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::HoistDown, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::HoistDown); // ✅ 동일 LED
+
     int ax = 4;
     long long tgt = 68000;
     StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
@@ -2086,6 +2169,10 @@ void HoistDown() {
 }
 void HoistUp() {
     if (!g_commStarted) { SetTaskState(TaskId::HoistUp, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::HoistUp, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::HoistUp); // ✅ 동일 LED
+
     int ax = 4;
     long long tgt = 0;
     StartMoveWithApproach(ax, tgt, TaskId::HoistUp,
@@ -2094,6 +2181,7 @@ void HoistUp() {
         3500, { 1000.0, 80.0, 10.0 });
 }
 void DoStopAll(HWND hWnd) {
+    LedCancel(hWnd);  // ✅ 추가
     g_bcRunner.Stop();
     for (int a = 0; a < 9; ++a) StopAxis(a);
     for (int i = 0; i < (int)TaskId::COUNT; ++i) {
@@ -2102,6 +2190,10 @@ void DoStopAll(HWND hWnd) {
 }
 void GoWorkstation() {
     if (!g_commStarted) { SetTaskState(TaskId::GoWorkstation, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::GoWorkstation, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::GoWorkstation); // ✅ 동일 LED
+
     BarcodeParams p{};
     p.axis = 7;
     p.targetBarcodeAbs = 1457;
@@ -2113,6 +2205,10 @@ void GoWorkstation() {
 }
 void GoLeft() {
     if (!g_commStarted) { SetTaskState(TaskId::GoLeft, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::GoLeft, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::GoLeft); // ✅ 동일 LED
+
     BarcodeParams p{};
     p.axis = 7;
     p.targetBarcodeAbs = 140;
@@ -2125,6 +2221,10 @@ void GoLeft() {
 
 void GoRight() {
     if (!g_commStarted) { SetTaskState(TaskId::GoRight, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::GoRight, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::GoRight); // ✅ 동일 LED
+
     BarcodeParams p{};
     p.axis = 7;
     p.targetBarcodeAbs = 2776;
@@ -2152,6 +2252,10 @@ void Forward();
 void Backward();
 void Forking() {
     if (!g_commStarted) { SetTaskState(TaskId::Forking, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Forking, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Forking); // ✅ 동일 LED
+
     int ax = 1;
     long long tgt = 65000;
     StartMoveWithApproach(ax, tgt, TaskId::Forking,
@@ -2161,8 +2265,12 @@ void Forking() {
 }
 void Unforking() {
     if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Unforking, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Unforking); // ✅ 동일 LED
+
     int ax = 1;
-    long long tgt = -20;
+    long long tgt = -20; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
     StartMoveWithApproach(ax, tgt, TaskId::Unforking,
         20000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
@@ -2170,8 +2278,12 @@ void Unforking() {
 }
 
 // Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
-void Down(){
+void Down() {
     if (!g_commStarted) { SetTaskState(TaskId::Down, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Down, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Down); // ✅ 동일 LED
+
     int ax = 2;
     long long tgt = -80000;
     StartMoveWithApproach(ax, tgt, TaskId::Down,
@@ -2179,8 +2291,12 @@ void Down(){
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
-void Up(){
+void Up() {
     if (!g_commStarted) { SetTaskState(TaskId::Up, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Up, TaskState::Running);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Up); // ✅ 동일 LED
+
     int ax = 2;
     long long tgt = 80000;
     StartMoveWithApproach(ax, tgt, TaskId::Up,
@@ -2493,6 +2609,68 @@ static bool g_ax5Bwd_L4SawOff = false;   // Right(시작 124)에서: L4 ON→OFF
 static bool g_ax5Bwd_L4SawOff2 = false;  // Left에서: L4가 OFF로 떨어진 적이 있는지 (정지 조건용)
 static bool g_ax5Bwd_L3SawOff2 = false;  // Right에서: L3가 OFF로 떨어진 적이 있는지 (정지 조건용)
 
+// =====================
+// Common LED Blink Manager (addr=38, bit=3/4)
+// =====================
+static const int  LED_ADDR = 38;
+static const int  LED_BIT_A = 3;
+static const int  LED_BIT_B = 4;
+static const DWORD LED_BLINK_MS = 500;
+static const UINT  IDT_LED_BLINK = 41001; // 기존 타이머랑 안 겹치게
+
+static bool   g_ledBlinkActive = false;
+static bool   g_ledBlinkStateOn = false;
+static DWORD  g_ledLastToggleTick = 0;
+static TaskId g_ledOwnerTask = TaskId::COUNT;
+
+static void LedSet(bool on) {
+    WriteOutputBit(LED_ADDR, LED_BIT_A, on, true);
+    WriteOutputBit(LED_ADDR, LED_BIT_B, on, true);
+}
+
+static void LedCancel(HWND hWnd) {
+    g_ledBlinkActive = false;
+    g_ledOwnerTask = TaskId::COUNT;
+    KillTimer(hWnd, IDT_LED_BLINK);
+    LedSet(false); // 취소/정지 시 OFF (원하면 true로 바꿔도 됨)
+}
+
+static void LedHoldOn(HWND hWnd) {
+    g_ledBlinkActive = false;
+    g_ledOwnerTask = TaskId::COUNT;
+    KillTimer(hWnd, IDT_LED_BLINK);
+    LedSet(true);  // 완료 시 ON 고정
+}
+
+static void LedStartBlinkForTask(HWND hWnd, TaskId tid) {
+    // 다른 작업 LED가 돌고 있으면 끊고 새로 시작
+    KillTimer(hWnd, IDT_LED_BLINK);
+
+    g_ledBlinkActive = true;
+    g_ledOwnerTask = tid;
+    g_ledBlinkStateOn = false;
+    g_ledLastToggleTick = GetTickCount();
+
+    LedSet(false);
+    SetTimer(hWnd, IDT_LED_BLINK, 50, nullptr); // 50ms 폴링, 500ms 토글
+}
+
+// Called by SetTaskState() (hook) to finish the blink cycle.
+void LedOnTaskStateChanged(HWND hWnd, TaskId tid, TaskState st)
+{
+    if (!hWnd) return;
+    if (g_ledOwnerTask != tid) return;
+
+    if (st == TaskState::Done) {
+        // 요구사항: 동작 완료 후 계속 ON 유지
+        LedHoldOn(hWnd);
+    }
+    else if (st == TaskState::Failed || st == TaskState::Stopped) {
+        // 실패/중단은 깜빡임 종료 (OFF)
+        LedCancel(hWnd);
+    }
+}
+
 // AX5 UI/status
 static bool g_ax5LastCheckOk = false;
 static std::wstring g_ax5LastCheckName = L"";
@@ -2584,7 +2762,7 @@ static Ax5Side DetectAx5SideFromLimits(bool l1, bool l2, bool l3, bool l4)
     if (l1 && l2 && l3 && l4) return Ax5Side::Center;
     if (!l1 && l2 && l3 && l4) return Ax5Side::LeftBackward;
     if (l1 && !l2 && l3 && l4) return Ax5Side::RightBackward;
-	if (l1 && l2 && !l3 && l4) return Ax5Side::LeftForward;  // Forward 중 Left 도착 예상
+    if (l1 && l2 && !l3 && l4) return Ax5Side::LeftForward;  // Forward 중 Left 도착 예상
     if (l1 && l2 && l3 && !l4) return Ax5Side::RightForward;  // Forward 중 Left 도착 예상
     return Ax5Side::Unknown;
 }
@@ -2607,8 +2785,8 @@ static void SyncAx5PrevLimitsToCurrent()
 // Travel settings for AX5 "search move" (state machine will decel/stop by limits)
 static const long long AX5_FORWARD_TRAVEL_PULSE = 8000000;  // + direction long move
 static const long long AX5_BACKWARD_TRAVEL_PULSE = 8000000; // - direction long move
-static const double    AX5_CRUISE_VEL_PPS = 1000.0;
-static const double    AX5_CRUISE_ACC_MS = 200.0;
+static const double    AX5_CRUISE_VEL_PPS = 5000.0;
+static const double    AX5_CRUISE_ACC_MS = 1000.0;
 static const double    AX5_CRUISE_DEC_MS = 200.0;
 
 static void StartAx5LongMove(int dirSign)
@@ -2629,6 +2807,8 @@ static void StartAx5LongMove(int dirSign)
 // backward(): AX5 -방향 동작. 시작은 Center(1,2,3,4 ON)에서, 직전(또는 기대) Left/Right를 기준으로 -이동을 시작.
 void Forward()
 {
+    WriteOutputBit(38, 2, true, true); //전진 led on
+
     // Task 시작 표시
     SetTaskState(TaskId::Forward, TaskState::Running);
     g_ax5ActiveTask = TaskId::Forward;
@@ -2676,6 +2856,8 @@ void Forward()
 
 void Backward()
 {
+    WriteOutputBit(38, 1, true, true); //후진 led on
+
     // Task 시작 표시
     SetTaskState(TaskId::Backward, TaskState::Running);
     g_ax5ActiveTask = TaskId::Backward;
@@ -2760,6 +2942,8 @@ static void AxLimitSensorTimerProc(HWND)
         const double vcmd0 = st0.axesStatus[0].velocityCmd;
         const double vth = 2.0; // pps threshold to treat as moving
         const bool isMoving = (vcmd0 > vth) || (vcmd0 < -vth);
+        const double vact0 = std::fabs(st0.axesStatus[0].actualVelocity);
+        const bool isIdle = (vact0 <= 1.0);
 
         if (ax0) {
             // Stop ONLY when the limit first turns ON (rising edge).
@@ -2783,6 +2967,15 @@ static void AxLimitSensorTimerProc(HWND)
                     }
                 }
             }
+
+            // Open: AX0 리밋센서로 Stop되어 축이 정지하면 동작 완료
+            if (isIdle) {
+                TaskState openSt = GetTaskState(TaskId::Open);
+                if (openSt == TaskState::Running || openSt == TaskState::Stopped) {
+                    SetTaskState(TaskId::Open, TaskState::Done);
+                }
+            }
+
         }
         else {
             g_ax0LimitOnTick = 0;
@@ -2815,6 +3008,17 @@ static void AxLimitSensorTimerProc(HWND)
                 g_ax1HomePending = false;
             }
         }
+        // Unforking: AX1 리밋 조건(!L1 && !L2)로 Stop되고 축이 정지하면 동작 완료
+        CoreMotionStatus st1{};
+        g_cm.GetStatus(&st1);
+        const double v1 = std::fabs(st1.axesStatus[1].actualVelocity);
+        if (v1 <= 1.0) {
+            TaskState ufSt = GetTaskState(TaskId::Unforking);
+            if (ufSt == TaskState::Running || ufSt == TaskState::Stopped) {
+                SetTaskState(TaskId::Unforking, TaskState::Done);
+            }
+        }
+
 
     }
     else {
@@ -2825,10 +3029,28 @@ static void AxLimitSensorTimerProc(HWND)
 
 
     // ---------------- AX2: if UP or DOWN ON -> stop ----------------
-    if ((ax2_up && ax3_up)|| (ax2_dn && ax3_dn)) {
+    // 요구사항: Up/Down은 리밋센서에 닿아 멈추면 완료 처리
+    const bool ax2UpStop = (ax2_up && ax3_up);
+    const bool ax2DnStop = (ax2_dn && ax3_dn);
+
+    if (ax2UpStop || ax2DnStop) {
         if (!g_ax2StopIssued) {
             StopAxis(2);
             g_ax2StopIssued = true;
+        }
+
+        CoreMotionStatus st2{};
+        g_cm.GetStatus(&st2);
+        const double v2 = std::fabs(st2.axesStatus[2].actualVelocity);
+        if (v2 <= 1.0) {
+            TaskState upSt = GetTaskState(TaskId::Up);
+            if (ax2UpStop && (upSt == TaskState::Running || upSt == TaskState::Stopped)) {
+                SetTaskState(TaskId::Up, TaskState::Done);
+            }
+            TaskState dnSt = GetTaskState(TaskId::Down);
+            if (ax2DnStop && (dnSt == TaskState::Running || dnSt == TaskState::Stopped)) {
+                SetTaskState(TaskId::Down, TaskState::Done);
+            }
         }
     }
     else {
@@ -2927,12 +3149,14 @@ static void AxLimitSensorTimerProc(HWND)
 
                 if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
+                    WriteOutputBit(38, 2, false, true); //전진 led off
                     g_ax5StopIssued = true;
 
                     g_ax5LastCheckName = L"PLUS_L_STOP";
                     g_ax5LastCheckOk = true;
                     g_ax5Side = Ax5Side::LeftForward; // 정지 패턴이 LeftForward라 즉시 반영
                     g_ax5UiExtra = L"Plus STOP (Left): 1o2o3x4o";
+
                 }
             }
 
@@ -2952,12 +3176,14 @@ static void AxLimitSensorTimerProc(HWND)
 
                 if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
+                    WriteOutputBit(38, 2, false, true); //전진 led off
                     g_ax5StopIssued = true;
 
                     g_ax5LastCheckName = L"PLUS_R_STOP";
                     g_ax5LastCheckOk = true;
                     g_ax5Side = Ax5Side::RightForward; // 정지 패턴이 RightForward라 즉시 반영
                     g_ax5UiExtra = L"Plus STOP (Right): 1o2o3o4x";
+
                 }
             }
         }
@@ -2981,6 +3207,7 @@ static void AxLimitSensorTimerProc(HWND)
 
                 if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
+                    WriteOutputBit(38, 1, false, true); //후진 led off
                     g_ax5StopIssued = true;
 
                     g_ax5LastCheckName = L"MINUS_L_STOP";
@@ -3006,6 +3233,7 @@ static void AxLimitSensorTimerProc(HWND)
 
                 if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
+                    WriteOutputBit(38, 1, false, true); //후진 led off
                     g_ax5StopIssued = true;
 
                     g_ax5LastCheckName = L"MINUS_R_STOP";
@@ -3407,6 +3635,9 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // 창이 열릴 때 STO 펄스 1회 (오류 클리어)
         DoGripServoOff_Compat(hWnd);
 
+        // 요구사항: 기본은 ON 유지, 동작 중에는 깜빡임
+        LedSet(true);
+
         return 0;
     }
     case WM_SIZE:
@@ -3476,6 +3707,17 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_TIMER:
         if (wParam == IDT_AX4_SENSOR_POLL) {
             Axis2SensorTimerProc(hWnd);
+            return 0;
+        }
+        else if (wParam == IDT_LED_BLINK) {
+            if (g_ledBlinkActive) {
+                DWORD now = GetTickCount();
+                if (now - g_ledLastToggleTick >= LED_BLINK_MS) {
+                    g_ledLastToggleTick = now;
+                    g_ledBlinkStateOn = !g_ledBlinkStateOn;
+                    LedSet(g_ledBlinkStateOn);
+                }
+            }
             return 0;
         }
         else if (wParam == IDT_AX_LIMIT_POLL) {
