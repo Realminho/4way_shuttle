@@ -185,7 +185,7 @@ struct BarcodeParams {
     double corrDec = 300.0;   // ms
 
     // (표시용/호환용) 기존 deadband 필드 유지 (main 알고리즘은 arriveCnt=±2cnt 사용)
-    int deadband = 2;
+    int deadband = 1;
 
     // Conversion
     double gear = 4.4248;
@@ -2199,7 +2199,7 @@ void GoWorkstation() {
     p.targetBarcodeAbs = 1457;
     p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
-    p.deadband = 2;
+    p.deadband = 1;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
     g_bcRunner.Start(p, TaskId::GoWorkstation);
 }
@@ -2214,7 +2214,7 @@ void GoLeft() {
     p.targetBarcodeAbs = 140;
     p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
-    p.deadband = 2;
+    p.deadband = 1;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
     g_bcRunner.Start(p, TaskId::GoLeft);
 }
@@ -2230,7 +2230,7 @@ void GoRight() {
     p.targetBarcodeAbs = 2776;
     p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
-    p.deadband = 2;
+    p.deadband = 1;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
     g_bcRunner.Start(p, TaskId::GoRight);
 }
