@@ -158,7 +158,7 @@ void ResetAllTaskStates() {
 }
 
 // =======================================
-// Barcode follower (기존 유지)
+// Barcode follower (NO ProfileStop, smooth decel + aDecEma scale + jerk-limited S-curve)
 // =======================================
 struct BarcodeParams {
     // 주행부 축 (요구사항: 7번)
@@ -186,6 +186,7 @@ struct BarcodeParams {
     double motorCpr = 10000.0;  // pulses per motor rev
     double bcMmPerCnt = 1.07;   // mm per barcode count
 };
+
 class BarcodeFollower {
 public:
     void Start(const BarcodeParams& p, TaskId taskToReport) {
@@ -260,23 +261,6 @@ private:
         return ReadAxis_TxPDO_6063(kAxisSlaveId[kBarcodeAxis_], out);
     }
 
-    // ✅ StopAxis 대신: "현재 위치로 AbsMove" → 프로파일 감속으로 0속도 유도
-    void ProfileStop(int ax, double vel_pps, double acc_ms, double dec_ms) {
-        CoreMotionStatus st{};
-        g_cm.GetStatus(&st);
-        long long curPos = (long long)st.axesStatus[ax].actualPos;
-
-        vel_pps = std::max(50.0, vel_pps);
-        acc_ms = std::max(1.0, acc_ms);
-        dec_ms = std::max(1.0, dec_ms);
-
-        StartAbsMoveWithProfile(ax, curPos, vel_pps, acc_ms, dec_ms);
-
-        lastCmdVel_ = vel_pps;
-        lastCmdTarget_ = curPos;
-        lastCmdTick_ = GetTickCount64();
-    }
-
     void SendMoveThrottled(
         int ax,
         long long absTarget,
@@ -309,24 +293,18 @@ private:
         }
     }
 
-    // ---- runtime state (main과 동일한 개념 유지) ----
-    enum Phase { IDLE = 0, COARSE = 1, COARSE_BRAKE = 2, FINE = 3, DONE = 4 };
+    // ---- runtime state (ProfileStop/COARSE_BRAKE 제거) ----
+    enum Phase { IDLE = 0, COARSE = 1, FINE = 2, DONE = 3 };
     Phase phase_ = IDLE;
 
     long long targetBarcodeAbs_ = 0;
     long long coarseTargetBarcodeAbs_ = 0;
 
-    // coarse → 목표-10cnt
-    int preStopCnt_ = 10;
+    // coarse → 목표-preStopCnt_ (preStop 구간에서 "속도만" 0에 수렴시킴)
+    int preStopCnt_ = 10;                // 원래 10 유지 (필요시 20 추천)
     int coarseArriveCnt_ = 1;
     int coarseStableTicksNeed_ = 5;
     int coarseStableTicks_ = 0;
-
-    // profile stop 파라미터(StopAxis 대신)
-    double coarseBrakeVelPps_ = 800.0;
-    double coarseBrakeAccMs_ = 500.0;
-    double coarseBrakeDecMs_ = 500.0;
-    double coarseStopVelThreshPps_ = 80.0;
 
     // fine → ±2cnt 안정화
     int arriveCnt_ = 2;
@@ -357,6 +335,9 @@ private:
     ULONGLONG stopCooldownUntil_ = 0;
     ULONGLONG fineStartCooldownUntil_ = 0;
 
+    // ===== Added: jerk-limit parameter =====
+    double maxJerkPps2_ = 25000.0;   // pps/s (tick당 dv 제한 = maxJerkPps2_ * dtSec_)
+
     void ThreadProc() {
         const int ax = params_.axis;
 
@@ -382,6 +363,11 @@ private:
         havePrevV_ = false;
         vPrevPps_ = 0.0;
         aDecEma_ = 0.0;
+
+        // command history reset
+        lastCmdVel_ = 0.0;
+        lastCmdTarget_ = 0;
+        lastCmdTick_ = GetTickCount64();
 
         SetTaskState(reportTask_, TaskState::Running);
 
@@ -434,7 +420,7 @@ private:
 
             // phase에 따라 활성 목표(6063 abs)
             long long activeTargetAbs =
-                (phase_ == COARSE || phase_ == COARSE_BRAKE) ? coarseTargetBarcodeAbs_ : targetBarcodeAbs_;
+                (phase_ == COARSE) ? coarseTargetBarcodeAbs_ : targetBarcodeAbs_;
 
             long long bcErr = activeTargetAbs - (long long)now6063;
             long long bcErrAbs = llabs(bcErr);
@@ -481,40 +467,27 @@ private:
             if (sgn != 0) lastErrSign_ = sgn;
 
             // ==========================
-            // PHASE: COARSE_BRAKE
-            // ==========================
-            if (phase_ == COARSE_BRAKE) {
-                if (vCurPps <= coarseStopVelThreshPps_) {
-                    phase_ = FINE;
-                    arriveStableTicks_ = 0;
-
-                    long long fe = targetBarcodeAbs_ - (long long)now6063;
-                    lastErrSign_ = sgnll(fe);
-                    signFlipTicks_ = 0;
-
-                    fineStartCooldownUntil_ = GetTickCount64() + 120;
-
-                    // command 갱신 유도
-                    lastCmdVel_ = 0;
-                    lastCmdTarget_ = 0;
-                }
-                ::Sleep(POLL_MS_);
-                continue;
-            }
-
-            // ==========================
-            // PHASE: COARSE
+            // PHASE: COARSE (NO ProfileStop, smooth decel + aDecEma scale + jerk limit)
             // ==========================
             if (phase_ == COARSE) {
+                // coarse target 도달 안정화 -> 바로 FINE 전환
                 if (bcErrAbs <= coarseArriveCnt_) {
                     if (++coarseStableTicks_ >= coarseStableTicksNeed_) {
-                        ProfileStop(ax, coarseBrakeVelPps_, coarseBrakeAccMs_, coarseBrakeDecMs_);
+                        phase_ = FINE;
+                        arriveStableTicks_ = 0;
 
-                        stopCooldownUntil_ = GetTickCount64() + 120;
-                        fineStartCooldownUntil_ = stopCooldownUntil_;
+                        long long fe = targetBarcodeAbs_ - (long long)now6063;
+                        lastErrSign_ = sgnll(fe);
+                        signFlipTicks_ = 0;
+
+                        // 전환 직후 명령 충돌 방지 (필요시 유지)
+                        fineStartCooldownUntil_ = GetTickCount64() + 120;
+
+                        // command 갱신 유도
+                        lastCmdVel_ = 0;
+                        lastCmdTarget_ = 0;
 
                         coarseStableTicks_ = 0;
-                        phase_ = COARSE_BRAKE;
                     }
                     ::Sleep(POLL_MS_);
                     continue;
@@ -549,12 +522,49 @@ private:
                 double distForPlan = (double)distAbs - (double)marginPulses;
                 if (distForPlan < 0) distForPlan = 0;
 
+                // 기본 stop-distance 기반 속도 상한
                 double vEnvMain = std::min(params_.mainVel, VelLimitFromDist(distForPlan, aMainDec));
 
-                if (bcErrAbs <= (preStopCnt_ + 10))
-                    vEnvMain = std::min(vEnvMain, std::max(200.0, creepVel_));
+                // ---------- Smooth preStop decel (ratio^1.5) ----------
+                // COARSE 목표(coarseTarget) 근처에서 속도만 부드럽게 0쪽으로 수렴
+                if (bcErrAbs <= preStopCnt_) {
+                    // ratio: 멀면 1, 가까울수록 0
+                    double ratio = std::clamp((double)bcErrAbs / (double)std::max(1, preStopCnt_), 0.0, 1.0);
 
-                if (vEnvMain < 50.0 && distAbs > 0) vEnvMain = 50.0;
+                    // 더 부드러운 곡선: ratio^1.5
+                    double smooth = std::pow(ratio, 1.5);
+
+                    // ramp (저속 바닥값)
+                    const double vMin = 40.0;
+                    const double vMax = std::max(200.0, creepVel_);
+
+                    double vRamp = vMin + (vMax - vMin) * smooth;
+
+                    // aDecEma 기반 자동 스케일 (감속 잘 안되면 더 보수적으로)
+                    if (aDecEma_ > 0.0) {
+                        const double aRef = 18000.0; // 튜닝 포인트
+                        double decScale = std::clamp(aDecEma_ / aRef, 0.5, 1.0);
+                        vRamp *= decScale;
+                    }
+
+                    vEnvMain = std::min(vEnvMain, vRamp);
+                }
+                else if (bcErrAbs <= (preStopCnt_ + 10)) {
+                    // 기존 close-in 제한 유지(완만)
+                    vEnvMain = std::min(vEnvMain, std::max(200.0, creepVel_));
+                }
+
+                // ---------- jerk 제한 (S-curve 효과) ----------
+                // tick당 속도 변화량 제한으로 "툭" 줄어드는 것을 방지
+                {
+                    double maxDv = std::max(1.0, maxJerkPps2_) * dtSec_;
+                    double dvCmd = vEnvMain - lastCmdVel_;
+                    if (std::fabs(dvCmd) > maxDv) {
+                        vEnvMain = lastCmdVel_ + std::copysign(maxDv, dvCmd);
+                    }
+                }
+
+                if (vEnvMain < 30.0 && distAbs > 0) vEnvMain = 30.0;
 
                 long long curPos = (long long)st.axesStatus[ax].actualPos;
                 long long absTarget = curPos + remainingPulses;
@@ -638,7 +648,9 @@ private:
 
     std::thread worker_;
 };
+
 static BarcodeFollower g_bcRunner;
+
 
 // =======================================
 // Move monitors (기존 유지)
@@ -948,7 +960,7 @@ static const DWORD AX_LIMIT_POLL_MS = 5;
 static const DWORD AX0_LIMIT_HOME_HOLD_MS = 1000;
 
 // AX5: decel profile (tune as needed)
-static const double AX5_DECEL_VEL_PPS = 800.0;
+static const double AX5_DECEL_VEL_PPS = 500.0;
 static const double AX5_DECEL_ACC_MS = 120.0;
 static const double AX5_DECEL_DEC_MS = 120.0;
 static const long long AX5_DECEL_LOOKAHEAD_PULSE = 250000; // "far enough" target for slow approach
@@ -1669,7 +1681,7 @@ void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
 bool IsAxisLeft()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 509;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 140;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1684,7 +1696,7 @@ bool IsAxisLeft()
 bool IsAxisRight()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 2475;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 2775;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1699,7 +1711,7 @@ bool IsAxisRight()
 bool IsAxisWorkstation()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 1400;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc =1457;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -2051,7 +2063,7 @@ void Open(){
 
 void Close() {
     if (!g_commStarted) { SetTaskState(TaskId::Close, TaskState::Failed); return; }
-    StartAbsMoveWithProfile(0, 48000, 20000, 100, 100);
+    StartAbsMoveWithProfile(0, 50600, 20000, 100, 100);
 
 }
 
@@ -2092,8 +2104,8 @@ void GoWorkstation() {
     if (!g_commStarted) { SetTaskState(TaskId::GoWorkstation, TaskState::Failed); return; }
     BarcodeParams p{};
     p.axis = 7;
-    p.targetBarcodeAbs = 1400;
-    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.targetBarcodeAbs = 1457;
+    p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 2;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
@@ -2103,8 +2115,8 @@ void GoLeft() {
     if (!g_commStarted) { SetTaskState(TaskId::GoLeft, TaskState::Failed); return; }
     BarcodeParams p{};
     p.axis = 7;
-    p.targetBarcodeAbs = 509;
-    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.targetBarcodeAbs = 140;
+    p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 2;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
@@ -2115,8 +2127,8 @@ void GoRight() {
     if (!g_commStarted) { SetTaskState(TaskId::GoRight, TaskState::Failed); return; }
     BarcodeParams p{};
     p.axis = 7;
-    p.targetBarcodeAbs = 2475;
-    p.mainVel = 1000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
+    p.targetBarcodeAbs = 2776;
+    p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 2;
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
@@ -2142,37 +2154,37 @@ void Forking() {
     if (!g_commStarted) { SetTaskState(TaskId::Forking, TaskState::Failed); return; }
     int ax = 1;
     long long tgt = 65000;
-    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        20000.0, 100.0, 100.0,
+    StartMoveWithApproach(ax, tgt, TaskId::Forking,
+        20000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
-        1000, { 1000.0, 80.0, 10.0 });
+        2000, { 1000.0, 80.0, 10.0 });
 }
 void Unforking() {
     if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
     int ax = 1;
     long long tgt = -20;
-    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        20000.0, 100.0, 100.0,
+    StartMoveWithApproach(ax, tgt, TaskId::Unforking,
+        20000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
-        1000, { 1000.0, 80.0, 10.0 });
+        2000, { 1000.0, 80.0, 10.0 });
 }
 
 // Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
 void Down(){
-    if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+    if (!g_commStarted) { SetTaskState(TaskId::Down, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = -20;
-    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        20000.0, 100.0, 100.0,
+    long long tgt = -80000;
+    StartMoveWithApproach(ax, tgt, TaskId::Down,
+        10000.0, 100.0, 100.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
 void Up(){
-    if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
+    if (!g_commStarted) { SetTaskState(TaskId::Up, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = -20;
-    StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        20000.0, 100.0, 100.0,
+    long long tgt = 80000;
+    StartMoveWithApproach(ax, tgt, TaskId::Up,
+        10000.0, 100.0, 100.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2447,7 +2459,7 @@ static bool g_ax2StopIssued = false;
 static bool g_ax3StopIssued = false;
 
 // ---------- AX5 state machine ----------
-enum class Ax5Side { Unknown, Left, Right, Center };
+enum class Ax5Side { Unknown, LeftForward, LeftBackward, RightForward, RightBackward, Center };
 enum class Ax5Dir { None, Plus, Minus };
 
 static Ax5Side g_ax5Side = Ax5Side::Unknown;
@@ -2461,21 +2473,37 @@ static int  g_ax5PlusRiseCount = 0; // L1 (left-side) or L2 (right-side) rising 
 static bool g_ax5DecelIssued = false;
 static bool g_ax5StopIssued = false;
 
+// AX5: 어떤 Task가 현재 AX5를 구동 중인지 표시 (Forward 완료 처리용)
+static TaskId g_ax5ActiveTask = TaskId::COUNT;
+
+
 // For "- direction from center" side inference
 static bool g_ax5FromCenter = false;
-static bool g_ax5SeenL1Off = false;
-static bool g_ax5SeenL2Off = false;
+// AX5 Forward(+) 전용 전이 플래그
+static bool g_ax5Fwd_L4SawOff = false;   // Left에서: L4 ON→OFF를 한번 봤는지
+static bool g_ax5Fwd_L1SawOff = false;   // Left에서: L1이 OFF로 떨어진 적이 있는지(정지 조건용)
 
+static bool g_ax5Fwd_L3SawOff = false;   // Right에서: L3 ON→OFF를 한번 봤는지
+static bool g_ax5Fwd_L2SawOff = false;   // Right에서: L2가 OFF로 떨어진 적이 있는지(정지 조건용)
+
+// AX5 Backward(-) 전용 전이 플래그
+static bool g_ax5Bwd_L3SawOff = false;   // Left(시작 123)에서: L3 ON→OFF를 봤는지 (감속용)
+static bool g_ax5Bwd_L4SawOff = false;   // Right(시작 124)에서: L4 ON→OFF를 봤는지 (감속용)
+
+static bool g_ax5Bwd_L4SawOff2 = false;  // Left에서: L4가 OFF로 떨어진 적이 있는지 (정지 조건용)
+static bool g_ax5Bwd_L3SawOff2 = false;  // Right에서: L3가 OFF로 떨어진 적이 있는지 (정지 조건용)
 
 // AX5 UI/status
 static bool g_ax5LastCheckOk = false;
 static std::wstring g_ax5LastCheckName = L"";
 static Ax5Dir GetAxisDirFromStatus(int axis) {
     CoreMotionStatus st{}; g_cm.GetStatus(&st);
-    double vcmd = st.axesStatus[axis].velocityCmd;
-    const double th = 2.0;
-    if (vcmd > th) return Ax5Dir::Plus;
-    if (vcmd < -th) return Ax5Dir::Minus;
+    // Use actualVelocity so direction detection works for StartPos-based jog/motion.
+    // velocityCmd can be near 0 in position profiles on some WMX3 setups.
+    const double v = st.axesStatus[axis].actualVelocity; // rpm
+    const double th = 1.0; // rpm threshold
+    if (v > th) return Ax5Dir::Plus;
+    if (v < -th) return Ax5Dir::Minus;
     return Ax5Dir::None;
 }
 
@@ -2506,15 +2534,58 @@ static void Ax5ResetState() {
     g_ax5DecelIssued = false;
     g_ax5StopIssued = false;
     g_ax5FromCenter = false;
-    g_ax5SeenL1Off = false;
-    g_ax5SeenL2Off = false;
+    // AX5 Forward(+) 전용 전이 플래그
+    g_ax5Fwd_L4SawOff = false;   // Left에서: L4 ON→OFF를 한번 봤는지
+    g_ax5Fwd_L1SawOff = false;   // Left에서: L1이 OFF로 떨어진 적이 있는지(정지 조건용)
+
+    g_ax5Fwd_L3SawOff = false;   // Right에서: L3 ON→OFF를 한번 봤는지
+    g_ax5Fwd_L2SawOff = false;   // Right에서: L2가 OFF로 떨어진 적이 있는지(정지 조건용)
+
+    // AX5 Backward(-) 전용 전이 플래그
+    g_ax5Bwd_L3SawOff = false;   // Left(시작 123)에서: L3 ON→OFF를 봤는지 (감속용)
+    g_ax5Bwd_L4SawOff = false;   // Right(시작 124)에서: L4 ON→OFF를 봤는지 (감속용)
+
+    g_ax5Bwd_L4SawOff2 = false;  // Left에서: L4가 OFF로 떨어진 적이 있는지 (정지 조건용)
+    g_ax5Bwd_L3SawOff2 = false;  // Right에서: L3가 OFF로 떨어진 적이 있는지 (정지 조건용)
 }
+
+static HWND g_hAx5StopFlagsStatic = nullptr;
+static std::wstring g_ax5UiStopFlags;   // Demo 왼쪽 UI에 표시할 Stop 조건 상태 4줄
+
+
+static const wchar_t* OnOff(bool v) { return v ? L"ON" : L"OFF"; }
+
+static void BuildAx5StopFlagsUi(bool l1, bool l2, bool l3, bool l4)
+{
+    bool uiFwdLeftPat = (l1 && l2 && !l3 && l4); // 1o 2o 3x 4o
+    bool uiFwdRightPat = (l1 && l2 && l3 && !l4); // 1o 2o 3o 4x
+    bool uiBwdLeftPat = (!l1 && l2 && l3 && l4); // 1x 2o 3o 4o
+    bool uiBwdRightPat = (l1 && !l2 && l3 && l4); // 1o 2x 3o 4o
+
+    // 참고로 StopIssued 상태도 같이 보고 싶으면 한 줄 추가로 넣어도 됨.
+    // 여기선 사용자가 원하는 "계속 실시간 표시"에 집중해서 4줄만 유지.
+    g_ax5UiStopFlags =
+        std::wstring(L"Forward left  : ") + OnOff(uiFwdLeftPat) + L"\r\n" +
+        std::wstring(L"Forward right : ") + OnOff(uiFwdRightPat) + L"\r\n" +
+        std::wstring(L"Backward left : ") + OnOff(uiBwdLeftPat) + L"\r\n" +
+        std::wstring(L"Backward right: ") + OnOff(uiBwdRightPat);
+
+    // ✅ 실제 Static 컨트롤 텍스트를 즉시 갱신 (핵심)
+    if (g_hAx5StopFlagsStatic) {
+        SetWindowTextW(g_hAx5StopFlagsStatic, g_ax5UiStopFlags.c_str());
+    }
+}
+
+
+
 // ---------- AX5 forward/backward helpers ----------
 static Ax5Side DetectAx5SideFromLimits(bool l1, bool l2, bool l3, bool l4)
 {
     if (l1 && l2 && l3 && l4) return Ax5Side::Center;
-    if (!l1 && l2 && l3 && l4) return Ax5Side::Left;
-    if (l1 && !l2 && l3 && l4) return Ax5Side::Right;
+    if (!l1 && l2 && l3 && l4) return Ax5Side::LeftBackward;
+    if (l1 && !l2 && l3 && l4) return Ax5Side::RightBackward;
+	if (l1 && l2 && !l3 && l4) return Ax5Side::LeftForward;  // Forward 중 Left 도착 예상
+    if (l1 && l2 && l3 && !l4) return Ax5Side::RightForward;  // Forward 중 Left 도착 예상
     return Ax5Side::Unknown;
 }
 
@@ -2536,7 +2607,7 @@ static void SyncAx5PrevLimitsToCurrent()
 // Travel settings for AX5 "search move" (state machine will decel/stop by limits)
 static const long long AX5_FORWARD_TRAVEL_PULSE = 8000000;  // + direction long move
 static const long long AX5_BACKWARD_TRAVEL_PULSE = 8000000; // - direction long move
-static const double    AX5_CRUISE_VEL_PPS = 4000.0;
+static const double    AX5_CRUISE_VEL_PPS = 1000.0;
 static const double    AX5_CRUISE_ACC_MS = 200.0;
 static const double    AX5_CRUISE_DEC_MS = 200.0;
 
@@ -2558,77 +2629,95 @@ static void StartAx5LongMove(int dirSign)
 // backward(): AX5 -방향 동작. 시작은 Center(1,2,3,4 ON)에서, 직전(또는 기대) Left/Right를 기준으로 -이동을 시작.
 void Forward()
 {
+    // Task 시작 표시
+    SetTaskState(TaskId::Forward, TaskState::Running);
+    g_ax5ActiveTask = TaskId::Forward;
+
     bool l1, l2, l3, l4;
     ReadAx5Limits(l1, l2, l3, l4);
-    Ax5Side side = DetectAx5SideFromLimits(l1, l2, l3, l4);
 
-    // forward: +방향 이동. 시작 위치가 Left 또는 Right인지 판단해서 그에 맞는 시퀀스로 센터에 접근한다.
-    if (side != Ax5Side::Left && side != Ax5Side::Right) {
-        g_ax5UiExtra = L"Side=Center/Unknown  Forward blocked";
+    // Left = 2,3,4 ON / Right = 1,3,4 ON
+    bool isLeft = (!l1 && l2 && l3 && l4);
+    bool isRight = (l1 && !l2 && l3 && l4);
+
+    if (!isLeft && !isRight) {
+        g_ax5UiExtra = L"Forward NG: invalid start sensors";
+        SetTaskState(TaskId::Forward, TaskState::Failed);
+        g_ax5ActiveTask = TaskId::COUNT;
         return;
     }
 
-    // Store side for backward()
-    g_ax5SelectedSide = side;
-    g_ax5LastNonCenterSide = side; // also remember
+    // ===== Forward 시작 초기화(중요) =====
+    g_ax5Side = isLeft ? Ax5Side::LeftBackward : Ax5Side::RightBackward;
 
-    // Reset one-shot flags
-    g_ax5ExpectedSide = Ax5Side::Unknown; // +방향에서는 -방향 기대치가 필요 없음
-    g_ax5Side = side;
     g_ax5DecelIssued = false;
     g_ax5StopIssued = false;
-    g_ax5SeenL1Off = false;
-    g_ax5SeenL2Off = false;
-    g_ax5FromCenter = false;
 
+    // ===== 전용 플래그 리셋 (핵심) =====
+    g_ax5Fwd_L4SawOff = false;
+    g_ax5Fwd_L1SawOff = false;
+    g_ax5Fwd_L3SawOff = false;
+    g_ax5Fwd_L2SawOff = false;
+
+
+    // 체크 표시 초기화
     g_ax5LastCheckName.clear();
     g_ax5LastCheckOk = false;
 
-    // Avoid false edges on first timer tick after starting motion
+    // UI
+    g_ax5UiExtra = isLeft ? L"Forward START (Left)" : L"Forward START (Right)";
+
+    // 이전 센서 상태를 현재로 동기화 (필수: 첫 tick에서 Rise/Fall 튀는 것 방지)
     SyncAx5PrevLimitsToCurrent();
 
+    // + 방향 장거리 이동 시작 (기존 함수 그대로 사용)
     StartAx5LongMove(+1);
 }
 
 void Backward()
 {
+    // Task 시작 표시
+    SetTaskState(TaskId::Backward, TaskState::Running);
+    g_ax5ActiveTask = TaskId::Backward;
+
     bool l1, l2, l3, l4;
     ReadAx5Limits(l1, l2, l3, l4);
-    Ax5Side sideNow = DetectAx5SideFromLimits(l1, l2, l3, l4);
 
-    // backward: -방향 이동. 센터(1,2,3,4 ON)에서 출발한다고 가정.
-    if (sideNow != Ax5Side::Center) {
-        g_ax5UiExtra = L"Side!=Center  Backward blocked";
+    // 시작 위치 판별(요구사항)
+    //  Left  : 1,2,3 ON
+    //  Right : 1,2,4 ON
+    bool isLeftStart = (l1 && l2 && !l3 && l4);   // (l4는 상관없음)
+    bool isRightStart = (l1 && l2 && l3 && !l4);   // (l3는 상관없음)
+
+    if (!isLeftStart && !isRightStart) {
+        g_ax5UiExtra = L"Backward NG: start pattern not (123 or 124)";
+        SetTaskState(TaskId::Backward, TaskState::Failed);
+        g_ax5ActiveTask = TaskId::COUNT;
         return;
     }
 
-    // Prefer the side decided by forward(). If none, fall back to last non-center observation.
-    Ax5Side expect = Ax5Side::Unknown;
-    if (g_ax5SelectedSide == Ax5Side::Left || g_ax5SelectedSide == Ax5Side::Right) {
-        expect = g_ax5SelectedSide;
-    }
-    else if (g_ax5LastNonCenterSide == Ax5Side::Left || g_ax5LastNonCenterSide == Ax5Side::Right) {
-        expect = g_ax5LastNonCenterSide;
-    }
-    else {
-        // default fallback
-        expect = Ax5Side::Left;
-    }
+    // 시작 Side 설정
+    g_ax5Side = isLeftStart ? Ax5Side::LeftForward : Ax5Side::RightForward;
 
-    g_ax5ExpectedSide = expect;
-    g_ax5Side = Ax5Side::Center;
-
+    // 공통 초기화
     g_ax5DecelIssued = false;
     g_ax5StopIssued = false;
-    g_ax5SeenL1Off = false;
-    g_ax5SeenL2Off = false;
-    g_ax5FromCenter = true;
 
     g_ax5LastCheckName.clear();
     g_ax5LastCheckOk = false;
 
+    // Backward 전용 플래그 리셋(핵심)
+    g_ax5Bwd_L3SawOff = false;
+    g_ax5Bwd_L4SawOff = false;
+    g_ax5Bwd_L4SawOff2 = false;
+    g_ax5Bwd_L3SawOff2 = false;
+
+    g_ax5UiExtra = isLeftStart ? L"Backward START (Left=123)" : L"Backward START (Right=124)";
+
+    // Prev 동기화 (첫 tick 에지 튐 방지)
     SyncAx5PrevLimitsToCurrent();
 
+    // - 방향 이동 시작
     StartAx5LongMove(-1);
 }
 
@@ -2658,6 +2747,9 @@ static void AxLimitSensorTimerProc(HWND)
     bool l4 = ReadInputBitRaw(AX5_LIMIT4_ADDR, AX5_LIMIT4_BIT, AX5_LIMIT4_ACTIVE_HIGH);
 
     UpdateAxLimitPanel(ax0, ax1_1, ax1_2, ax2_up, ax2_dn, ax3_up, ax3_dn, l1, l2, l3, l4);
+
+    // ✅ StopFlags UI 갱신 (실시간)
+    BuildAx5StopFlagsUi(l1, l2, l3, l4);
 
     DWORD now = GetTickCount();
 
@@ -2733,7 +2825,7 @@ static void AxLimitSensorTimerProc(HWND)
 
 
     // ---------------- AX2: if UP or DOWN ON -> stop ----------------
-    if (ax2_up || ax2_dn) {
+    if ((ax2_up && ax3_up)|| (ax2_dn && ax3_dn)) {
         if (!g_ax2StopIssued) {
             StopAxis(2);
             g_ax2StopIssued = true;
@@ -2741,17 +2833,6 @@ static void AxLimitSensorTimerProc(HWND)
     }
     else {
         g_ax2StopIssued = false;
-    }
-
-    // ---------------- AX3: if UP or DOWN ON -> stop ----------------
-    if (ax3_up || ax3_dn) {
-        if (!g_ax3StopIssued) {
-            StopAxis(3);
-            g_ax3StopIssued = true;
-        }
-    }
-    else {
-        g_ax3StopIssued = false;
     }
 
 
@@ -2763,6 +2844,8 @@ static void AxLimitSensorTimerProc(HWND)
     bool isCenter = (l1 && l2 && l3 && l4);
     bool isLeft = (!l1 && l2 && l3 && l4);
     bool isRight = (l1 && !l2 && l3 && l4);
+    bool isLeftForward = (l1 && l2 && !l3 && l4);
+    bool isRightForward = (l1 && l2 && l3 && !l4);
 
     bool l1Rise = (!g_ax5PrevL1 && l1);
     bool l2Rise = (!g_ax5PrevL2 && l2);
@@ -2779,8 +2862,17 @@ static void AxLimitSensorTimerProc(HWND)
         g_ax5DecelIssued = false;
         g_ax5StopIssued = false;
         g_ax5FromCenter = isCenter;
-        g_ax5SeenL1Off = false;
-        g_ax5SeenL2Off = false;
+
+        // ===== 전용 플래그 리셋 (핵심) =====
+        g_ax5Fwd_L4SawOff = false;
+        g_ax5Fwd_L1SawOff = false;
+        g_ax5Fwd_L3SawOff = false;
+        g_ax5Fwd_L2SawOff = false;
+
+        g_ax5Bwd_L3SawOff = false;   // Left(시작 123)에서: L3 ON→OFF를 봤는지 (감속용)
+        g_ax5Bwd_L4SawOff = false;   // Right(시작 124)에서: L4 ON→OFF를 봤는지 (감속용)
+        g_ax5Bwd_L4SawOff2 = false;  // Left에서: L4가 OFF로 떨어진 적이 있는지 (정지 조건용)
+        g_ax5Bwd_L3SawOff2 = false;  // Right에서: L3가 OFF로 떨어진 적이 있는지 (정지 조건용)
     }
 
     // Update side when idle (start/settled)
@@ -2790,115 +2882,136 @@ static void AxLimitSensorTimerProc(HWND)
             g_ax5ExpectedSide = Ax5Side::Unknown; // clear expectation when settled
         }
         else if (isLeft) {
-            g_ax5Side = Ax5Side::Left;
-            g_ax5LastNonCenterSide = Ax5Side::Left;
+            g_ax5Side = Ax5Side::LeftBackward;
+            g_ax5LastNonCenterSide = Ax5Side::LeftBackward;
         }
         else if (isRight) {
-            g_ax5Side = Ax5Side::Right;
-            g_ax5LastNonCenterSide = Ax5Side::Right;
+            g_ax5Side = Ax5Side::RightBackward;
+            g_ax5LastNonCenterSide = Ax5Side::RightBackward;
+        }
+        else if (isLeftForward) {
+            g_ax5Side = Ax5Side::LeftForward;
+            g_ax5LastNonCenterSide = Ax5Side::LeftForward;
+        }
+        else if (isRightForward) {
+            g_ax5Side = Ax5Side::RightForward;
+            g_ax5LastNonCenterSide = Ax5Side::RightForward;
         }
     }
     else {
         // If side is unknown, try to infer from current pattern during motion
         if (g_ax5Side == Ax5Side::Unknown) {
-            if (isLeft)  g_ax5Side = Ax5Side::Left;
-            else if (isRight) g_ax5Side = Ax5Side::Right;
+            if (isLeft)  g_ax5Side = Ax5Side::LeftBackward;
+            else if (isRight) g_ax5Side = Ax5Side::RightBackward;
             else if (isCenter) g_ax5Side = Ax5Side::Center;
+            else if (isLeftForward) g_ax5Side = Ax5Side::LeftForward;
+            else if (isRightForward) g_ax5Side = Ax5Side::RightForward;
         }
 
-        // ---- + direction ----
-        if (dir == Ax5Dir::Plus) {
-            if (g_ax5StopIssued) {
-                // mismatch detected or already stopped
-            }
-            else if (g_ax5Side == Ax5Side::Left) {
-                // + from Left: decel when L4 becomes ON, stop when L1 becomes ON, then check ALL ON
-                if (!g_ax5DecelIssued && (l4 || l4Rise)) Ax5IssueDecel(+1);
-                if (!g_ax5StopIssued && (l1 || l1Rise)) {
+        // ---------------- PLUS (+) ----------------
+        if (dir == Ax5Dir::Plus && !g_ax5StopIssued) {
+
+            // PLUS Left: from LeftBackward
+            if (g_ax5Side == Ax5Side::LeftBackward) {
+
+                // ✅ 감속 패턴: 1x 2o 3x 4o  => (!l1 && l2 && !l3 && l4)
+                bool decelPat = (!l1 && l2 && !l3 && l4);
+
+                // ✅ 정지 패턴: 1o 2o 3x 4o  => ( l1 && l2 && !l3 && l4)
+                bool stopPat = (l1 && l2 && !l3 && l4);
+
+                if (!g_ax5DecelIssued && decelPat) {
+                    Ax5IssueDecel(+1);
+                    g_ax5DecelIssued = true;
+                }
+
+                if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
                     g_ax5StopIssued = true;
 
-                    g_ax5LastCheckName = L"124";
-                    g_ax5LastCheckOk = (l1 && l2 && l4);
-                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Center;
+                    g_ax5LastCheckName = L"PLUS_L_STOP";
+                    g_ax5LastCheckOk = true;
+                    g_ax5Side = Ax5Side::LeftForward; // 정지 패턴이 LeftForward라 즉시 반영
+                    g_ax5UiExtra = L"Plus STOP (Left): 1o2o3x4o";
                 }
             }
-            else if (g_ax5Side == Ax5Side::Right) {
-                // + from Right: decel when L3 becomes ON, stop when L2 becomes ON, then check ALL ON
-                if (!g_ax5DecelIssued && (l3 || l3Rise)) Ax5IssueDecel(+1);
-                if (!g_ax5StopIssued && (l2 || l2Rise)) {
+
+            // PLUS Right: from RightBackward
+            else if (g_ax5Side == Ax5Side::RightBackward) {
+
+                // ✅ 감속 패턴: 1o 2x 3o 4x  => (l1 && !l2 && l3 && !l4)
+                bool decelPat = (l1 && !l2 && l3 && !l4);
+
+                // ✅ 정지 패턴: 1o 2o 3o 4x  => (l1 &&  l2 &&  l3 && !l4)
+                bool stopPat = (l1 && l2 && l3 && !l4);
+
+                if (!g_ax5DecelIssued && decelPat) {
+                    Ax5IssueDecel(+1);
+                    g_ax5DecelIssued = true;
+                }
+
+                if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
                     g_ax5StopIssued = true;
 
-                    g_ax5LastCheckName = L"123";
-                    g_ax5LastCheckOk = (l1 && l2 && l3);
-                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Center;
+                    g_ax5LastCheckName = L"PLUS_R_STOP";
+                    g_ax5LastCheckOk = true;
+                    g_ax5Side = Ax5Side::RightForward; // 정지 패턴이 RightForward라 즉시 반영
+                    g_ax5UiExtra = L"Plus STOP (Right): 1o2o3o4x";
                 }
             }
         }
 
-        // ---- - direction ----
-        if (dir == Ax5Dir::Minus) {
-            // -방향은 Center(1,2,3,4 ON)에서 Left 또는 Right로 빠져나가는 동작.
-            // backward()가 기대 방향을 지정한 경우(g_ax5ExpectedSide), 그쪽 분기만 사용한다.
-            if (g_ax5ExpectedSide != Ax5Side::Unknown && g_ax5Side == Ax5Side::Center) {
-                g_ax5Side = g_ax5ExpectedSide;
-            }
+        // ---------------- MINUS (-) ----------------
+        if (dir == Ax5Dir::Minus && !g_ax5StopIssued) {
 
-            // 기대 방향이 없을 때만, 먼저 OFF가 되는 센서로 방향을 추정한다.
-            if (g_ax5ExpectedSide == Ax5Side::Unknown) {
-                //   L1 OFF => Left
-                //   L2 OFF => Right
-                if (!g_ax5SeenL1Off && l1Fall) { g_ax5Side = Ax5Side::Left;  g_ax5SeenL1Off = true; }
-                if (!g_ax5SeenL2Off && l2Fall) { g_ax5Side = Ax5Side::Right; g_ax5SeenL2Off = true; }
-            }
-            else {
-                // forward()에서 정해진 기대 방향(g_ax5ExpectedSide)이 맞는지 확인:
-                //  - expect Left  : L1이 먼저 OFF 되어야 함 (L2가 먼저 OFF면 mismatch)
-                //  - expect Right : L2가 먼저 OFF 되어야 함 (L1이 먼저 OFF면 mismatch)
-                if (!g_ax5SeenL1Off && l1Fall) g_ax5SeenL1Off = true;
-                if (!g_ax5SeenL2Off && l2Fall) g_ax5SeenL2Off = true;
+            // MINUS Left: from LeftForward
+            if (g_ax5Side == Ax5Side::LeftForward) {
 
-                if (!g_ax5StopIssued) {
-                    if (g_ax5ExpectedSide == Ax5Side::Left && l2Fall && !g_ax5SeenL1Off) {
-                        StopAxis(5);
-                        g_ax5StopIssued = true;
-                        g_ax5LastCheckName = L"DIR";
-                        g_ax5LastCheckOk = false;
-                        g_ax5UiExtra = L"SideMismatch: expected Left but L2 fell first";
-                    }
-                    else if (g_ax5ExpectedSide == Ax5Side::Right && l1Fall && !g_ax5SeenL2Off) {
-                        StopAxis(5);
-                        g_ax5StopIssued = true;
-                        g_ax5LastCheckName = L"DIR";
-                        g_ax5LastCheckOk = false;
-                        g_ax5UiExtra = L"SideMismatch: expected Right but L1 fell first";
-                    }
+                // ✅ 감속 패턴: 1x 2o 3o 4x  => (!l1 && l2 && l3 && !l4)
+                bool decelPat = (!l1 && l2 && l3 && !l4);
+
+                // ✅ 정지 패턴: 1x 2o 3o 4o  => (!l1 && l2 && l3 &&  l4)
+                bool stopPat = (!l1 && l2 && l3 && l4);
+
+                if (!g_ax5DecelIssued && decelPat) {
+                    Ax5IssueDecel(-1);
+                    g_ax5DecelIssued = true;
                 }
-            }
 
-            if (g_ax5Side == Ax5Side::Left) {
-                // - toward Left: decel when L3 becomes ON, stop when L4 becomes ON, then check 2,3,4 ON
-                if (!g_ax5DecelIssued && !g_ax5StopIssued && (l3 || l3Rise)) Ax5IssueDecel(-1);
-                if (!g_ax5StopIssued && (l4 || l4Rise)) {
+                if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
                     g_ax5StopIssued = true;
 
-                    g_ax5LastCheckName = L"234";
-                    g_ax5LastCheckOk = (l2 && l3 && l4);
-                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Left;
+                    g_ax5LastCheckName = L"MINUS_L_STOP";
+                    g_ax5LastCheckOk = true;
+                    g_ax5Side = Ax5Side::LeftBackward; // 정지 패턴이 LeftBackward(isLeft)라 즉시 반영
+                    g_ax5UiExtra = L"Minus STOP (Left): 1x2o3o4o";
                 }
             }
-            else if (g_ax5Side == Ax5Side::Right) {
-                // - toward Right: decel when L4 becomes ON, stop when L3 becomes ON, then check 1,3,4 ON
-                if (!g_ax5DecelIssued && !g_ax5StopIssued && (l4 || l4Rise)) Ax5IssueDecel(-1);
-                if (!g_ax5StopIssued && (l3 || l3Rise)) {
+
+            // MINUS Right: from RightForward
+            else if (g_ax5Side == Ax5Side::RightForward) {
+
+                // ✅ 감속 패턴: 1o 2x 3x 4o  => (l1 && !l2 && !l3 && l4)
+                bool decelPat = (l1 && !l2 && !l3 && l4);
+
+                // ✅ 정지 패턴: 1o 2x 3o 4o  => (l1 && !l2 &&  l3 &&  l4)
+                bool stopPat = (l1 && !l2 && l3 && l4);
+
+                if (!g_ax5DecelIssued && decelPat) {
+                    Ax5IssueDecel(-1);
+                    g_ax5DecelIssued = true;
+                }
+
+                if (!g_ax5StopIssued && stopPat) {
                     StopAxis(5);
                     g_ax5StopIssued = true;
 
-                    g_ax5LastCheckName = L"134";
-                    g_ax5LastCheckOk = (l1 && l3 && l4);
-                    if (g_ax5LastCheckOk) g_ax5Side = Ax5Side::Right;
+                    g_ax5LastCheckName = L"MINUS_R_STOP";
+                    g_ax5LastCheckOk = true;
+                    g_ax5Side = Ax5Side::RightBackward; // 정지 패턴이 RightBackward(isRight)라 즉시 반영
+                    g_ax5UiExtra = L"Minus STOP (Right): 1o2x3o4o";
                 }
             }
         }
@@ -2907,8 +3020,10 @@ static void AxLimitSensorTimerProc(HWND)
     // Build AX5 UI status string
     const wchar_t* sideStr = L"Unknown";
     switch (g_ax5Side) {
-    case Ax5Side::Left:   sideStr = L"Left"; break;
-    case Ax5Side::Right:  sideStr = L"Right"; break;
+    case Ax5Side::LeftBackward:   sideStr = L"LeftBackward"; break;
+    case Ax5Side::RightBackward:  sideStr = L"RightBackward"; break;
+    case Ax5Side::LeftForward:   sideStr = L"LeftForward"; break;
+    case Ax5Side::RightForward:  sideStr = L"RightForward"; break;
     case Ax5Side::Center: sideStr = L"Center"; break;
     default: break;
     }
@@ -2928,6 +3043,7 @@ static void AxLimitSensorTimerProc(HWND)
 // 좌측: GPIO 제어/표시(토글/라벨)
 // 우측: Demo 버튼/상태/센서
 // =======================================
+
 enum : UINT_PTR {
     IDT_AX4_SENSOR_POLL = 0x2001,
     IDT_GPIO_REFRESH = 0x2002,
@@ -3066,6 +3182,20 @@ static void CreateLeftGPIOUI(HWND h, HINSTANCE hInst, int x, int y, int w, int h
         SetWindowText(g_hAxLimitStatics[3], _T("AX3 UP/DN : --/--"));
         SetWindowText(g_hAxLimitStatics[4], _T("AX4 : (kept - existing logic)"));
         SetWindowText(g_hAxLimitStatics[5], _T("AX5 L1..L4 : ----"));
+
+        // ✅ StopFlags 4줄 표시 Static (왼쪽 패널에 "실시간" 표시)
+        //   - SS_LEFT + 줄바꿈(\r\n) 표시를 위해 넉넉한 height
+        int stopY = sy + 6 * (lineH + 6) + 8;
+        g_hAx5StopFlagsStatic = CreateWindowW(
+            L"STATIC",
+            L"Forward left  : OFF\r\nForward right : OFF\r\nBackward left : OFF\r\nBackward right: OFF",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            sx, stopY, w - 48, 80,
+            h, nullptr, hInst, nullptr
+        );
+        if (g_hAx5StopFlagsStatic) {
+            SendMessageW(g_hAx5StopFlagsStatic, WM_SETFONT, (WPARAM)hText, TRUE);
+        }
     }
 
     DeleteObject(hTitle);

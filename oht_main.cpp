@@ -3875,6 +3875,10 @@ static LRESULT CALLBACK SerialWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 
 // =====================================================
 // Hybrid Barcode Demo (Stop-distance based auto decel)
+// NO ProfileStop, NO COARSE_BRAKE
+// + ratio^1.5 smoothing
+// + aDecEma-based vRamp auto scale
+// + jerk-limited S-curve 느낌(dv/tick 제한)
 // Copy-paste whole block
 // =====================================================
 
@@ -3941,27 +3945,26 @@ struct HybridBarcodeState
 	long long targetBarcodeRel = 0;     // final target - now (cnt)
 	long long remainingMotorPulse = 0;  // remaining pulses (final target 기준)
 
-	// ====== 2-Stage control ======
-	// COARSE: 목표 10cnt 전(coarseTarget)으로 접근
-	// COARSE_BRAKE: StopAxis 없이 "프로파일 감속으로" 속도 0 도달 대기
+	// ====== 2-Stage control (NO COARSE_BRAKE) ======
+	// COARSE: 목표 preStopCnt 전(coarseTarget)으로 접근 (속도만 부드럽게 0쪽으로 수렴)
 	// FINE: 1cnt(step)씩 ±2cnt 안으로 들어갈 때까지 접근
-	enum Phase { IDLE = 0, COARSE = 1, COARSE_BRAKE = 2, FINE = 3, DONE = 4 };
+	enum Phase { IDLE = 0, COARSE = 1, FINE = 2, DONE = 3 };
 	Phase phase = IDLE;
 
-	int preStopCnt = 10;                  // ✅ 목표보다 10cnt 전에 정지(속도0)
-	long long coarseTargetBarcodeAbs = 0; // 목표-10cnt의 임시 목표(6063 abs)
+	int preStopCnt = 10;                  // 목표보다 10cnt 앞(coarseTarget)
+	long long coarseTargetBarcodeAbs = 0; // 목표-preStopCnt의 임시 목표(6063 abs)
 
 	int coarseArriveCnt = 1;              // coarse 목표에 ±1cnt
 	int coarseStableTicksNeed = 5;        // 30ms*5=150ms 안정화
 	int coarseStableTicks = 0;
 
-	// ✅ "프로파일 정지" 파라미터(StopAxis 대신 사용)
-	double coarseBrakeVelPps = 800.0;     // 정지 명령 시 vel 상한(너무 작을 필요 없음)
-	double coarseBrakeAccMs = 500.0;
-	double coarseBrakeDecMs = 500.0;      // 작을수록 더 급감속(충격↑), 크면 부드러움↑
-	double coarseStopVelThreshPps = 80.0; // 이 이하이면 '거의 0속도'로 판정
+	// ★ 추가: coarse -> fine 전환시 "속도도 충분히 느릴 때" 전환(원치 않으면 큰 값으로)
+	double coarseToFineVelThreshPps = 120.0;
 
-	ULONGLONG fineStartCooldownUntil = 0; // coarse stop 이후 잠깐 대기 후 fine 시작
+	// ★ 추가: COARSE 목표 근처에서 속도 램프 적용 범위(cnt)
+	int coarseRampCnt = 20;               // 10이면 좀 급함, 20~30이 더 "스윽"
+
+	ULONGLONG fineStartCooldownUntil = 0; // coarse→fine 전환 직후 대기
 
 	// Main profile (UI)
 	double mainVel = 10000; // pps
@@ -4011,6 +4014,9 @@ struct HybridBarcodeState
 
 	// Stop cooldown (startpos/명령충돌 방지)
 	ULONGLONG stopCooldownUntil = 0;
+
+	// ★ 추가: jerk 제한 (tick당 dv 제한)
+	double maxJerkPps2 = 25000.0; // pps/s (dv_max = maxJerkPps2 * dt)
 };
 static HybridBarcodeState g_hbc;
 
@@ -4020,11 +4026,11 @@ struct HbcSnapshot {
 	double gear, wheelDia, motorCpr, bcMmPerCnt;
 };
 
-// ✅ gear 반영 (필수)
+// ✅ gear 반영 (필수) - 원 코드 구현 유지
 static inline double HBC_pulsesPerMm(const HbcSnapshot& s)
 {
-	// pulses per wheel rev = motorCpr * gear
-	// wheel circumference = pi * wheelDia
+	// pulses per wheel rev = motorCpr * gear 라는 주석이 있었지만,
+	// 기존 코드 흐름 유지: motorCpr / (pi*wheelDia)
 	return s.motorCpr / (3.14159265358979323846 * s.wheelDia);
 }
 static inline double HBC_bcToMm(const HbcSnapshot& s, long long bc)
@@ -4067,31 +4073,12 @@ static inline double HBC_VelLimitFromDist(double distPulses, double aDecPps2)
 }
 
 // =====================================================
-// ✅ Selected axis barcode read (axis=9 고정 제거)
+// ✅ Selected axis barcode read (axis=9 고정 유지: 원본 그대로)
 static bool Bc_ReadSelectedAxis_6063(int& outVal)
 {
 	int axis = 9;
 	if (axis < 0 || axis >= kNumAxes) return false;
 	return ReadAxis_TxPDO_6063(kAxisSlaveId[axis], outVal);
-}
-
-// =====================================================
-// ✅ StopAxis 대신 "현재 위치로 AbsMove"를 보내서 프로파일 감속으로 0속도 만들기
-static void HBC_ProfileStop(int ax, double vel_pps, double acc_ms, double dec_ms)
-{
-	// 현재 위치를 목표로 AbsMove를 보내면, 드라이브는 감속해서 정지(0속도)하게 됨
-	g_cm.GetStatus(&g_status);
-	long long curPos = g_status.axesStatus[ax].actualPos;
-
-	vel_pps = std::max(50.0, vel_pps);
-	acc_ms = std::max(1.0, acc_ms);
-	dec_ms = std::max(1.0, dec_ms);
-
-	StartAbsMoveWithProfile(ax, curPos, vel_pps, acc_ms, dec_ms);
-
-	g_hbc.lastCmdVel = vel_pps;
-	g_hbc.lastCmdTarget = curPos;
-	g_hbc.lastCmdTick = GetTickCount64();
 }
 
 // =====================================================
@@ -4154,6 +4141,11 @@ void HBC_Start(HWND hWnd)
 	g_hbc.vPrevPps = 0.0;
 	g_hbc.aDecEma = 0.0;
 
+	// command history reset
+	g_hbc.lastCmdVel = 0.0;
+	g_hbc.lastCmdTarget = 0;
+	g_hbc.lastCmdTick = GetTickCount64();
+
 	// Read UI parameters - Main profile
 	g_hbc.mainVel = GetDlgDouble(hWnd, ID_BC_EDIT_VEL, 10000);
 	g_hbc.mainAcc = GetDlgDouble(hWnd, ID_BC_EDIT_ACC, 1000);
@@ -4179,6 +4171,9 @@ void HBC_Start(HWND hWnd)
 	g_hbc.coarseArriveCnt = 1;
 	g_hbc.coarseStableTicksNeed = 5;
 
+	// ramp 범위 기본값 (원하면 UI로 빼도 됨)
+	g_hbc.coarseRampCnt = std::max(10, g_hbc.preStopCnt * 2); // 20 권장
+
 	int now6063 = 0;
 	if (!Bc_ReadSelectedAxis_6063(now6063)) {
 		MessageBox(hWnd, TEXT("Barcode Read Fail (6063)"), TEXT("Barcode"), MB_ICONWARNING);
@@ -4198,7 +4193,7 @@ void HBC_Start(HWND hWnd)
 		return;
 	}
 
-	// COARSE 임시 목표: 목표보다 10cnt 앞(방향 기준)
+	// COARSE 임시 목표: 목표보다 preStopCnt 앞(방향 기준)
 	g_hbc.coarseTargetBarcodeAbs = g_hbc.targetBarcodeAbs - (long long)dir * (long long)g_hbc.preStopCnt;
 
 	// initial sign
@@ -4249,15 +4244,14 @@ void HBC_UpdateUi(HWND hWnd)
 
 	const wchar_t* phaseStr =
 		(g_hbc.phase == HybridBarcodeState::IDLE) ? L"IDLE" :
-		(g_hbc.phase == HybridBarcodeState::COARSE) ? L"COARSE(to -10cnt)" :
-		(g_hbc.phase == HybridBarcodeState::COARSE_BRAKE) ? L"COARSE_BRAKE(profile stop)" :
+		(g_hbc.phase == HybridBarcodeState::COARSE) ? L"COARSE(to -preStopCnt, smooth decel)" :
 		(g_hbc.phase == HybridBarcodeState::FINE) ? L"FINE(step to ±2cnt)" :
 		L"DONE";
 
 	wchar_t st[980];
 	swprintf_s(st,
 		L"Run=%s Phase=%s Axis=%d Now6063=%d Target=%lld Err(cnt)=%lld RemPulses=%lld  "
-		L"CoarseTarget=%lld(preStop=%dcnt)  AutoCorrEntry(pulse)=%lld  "
+		L"CoarseTarget=%lld(preStop=%dcnt ramp=%dcnt)  AutoCorrEntry(pulse)=%lld  "
 		L"Arrive=±%dcnt(%d/%d) CoarseArr=±%dcnt(%d/%d) "
 		L"Main[V/A/D]=%.0f/%.0f/%.0f  Corr[V/A/D]=%.0f/%.0f/%.0f  aDecEma=%.0fpps2",
 		g_hbc.running ? L"Y" : L"N",
@@ -4269,6 +4263,7 @@ void HBC_UpdateUi(HWND hWnd)
 		pulses,
 		g_hbc.coarseTargetBarcodeAbs,
 		g_hbc.preStopCnt,
+		g_hbc.coarseRampCnt,
 		g_hbc.autoCorrEntryDistPulse,
 		g_hbc.arriveCnt, g_hbc.arriveStableTicks, g_hbc.arriveStableTicksNeed,
 		g_hbc.coarseArriveCnt, g_hbc.coarseStableTicks, g_hbc.coarseStableTicksNeed,
@@ -4281,7 +4276,7 @@ void HBC_UpdateUi(HWND hWnd)
 
 // =====================================================
 // Stop-distance based auto decel (with measured decel assist)
-// + 2-stage: COARSE to (target-10cnt) -> ProfileStop to 0 speed -> FINE step to ±2cnt
+// + 2-stage: COARSE to (target-preStopCnt) with smooth speed-only decel -> FINE step to ±2cnt
 void HBC_Poll(HWND hWnd)
 {
 	if (!g_hbc.running) return;
@@ -4296,8 +4291,7 @@ void HBC_Poll(HWND hWnd)
 
 	// phase에 따라 활성 목표(6063 abs)
 	long long activeTargetAbs =
-		(g_hbc.phase == HybridBarcodeState::COARSE || g_hbc.phase == HybridBarcodeState::COARSE_BRAKE)
-		? g_hbc.coarseTargetBarcodeAbs
+		(g_hbc.phase == HybridBarcodeState::COARSE) ? g_hbc.coarseTargetBarcodeAbs
 		: g_hbc.targetBarcodeAbs;
 
 	long long bcErr = activeTargetAbs - (long long)now6063;
@@ -4358,50 +4352,38 @@ void HBC_Poll(HWND hWnd)
 	long long pulsesPerCnt = llabs(HBC_bcToPulses(snap, 1));
 
 	// ==========================================================
-	// PHASE: COARSE_BRAKE (StopAxis 없이 프로파일 감속으로 0속도 만들기)
-	// ==========================================================
-	if (g_hbc.phase == HybridBarcodeState::COARSE_BRAKE)
-	{
-		// 0속도 근처 도달하면 FINE로 전환
-		if (vCurPps <= g_hbc.coarseStopVelThreshPps)
-		{
-			// final 목표로 FINE 접근
-			g_hbc.phase = HybridBarcodeState::FINE;
-			g_hbc.arriveStableTicks = 0;
-
-			long long finalErr = g_hbc.targetBarcodeAbs - (long long)now6063;
-			g_hbc.lastErrSign = HBC_signll(finalErr);
-			g_hbc.signFlipTicks = 0;
-
-			// 전환 직후 명령 충돌 방지
-			g_hbc.fineStartCooldownUntil = GetTickCount64() + 120;
-
-			// 커맨드 갱신 유도
-			g_hbc.lastCmdVel = 0;
-			g_hbc.lastCmdTarget = 0;
-		}
-		return;
-	}
-
-	// ==========================================================
-	// PHASE: COARSE (목표-10cnt로 접근하다가, 근처에서 ProfileStop 발동)
+	// PHASE: COARSE (NO ProfileStop, speed-only smooth decel)
 	// ==========================================================
 	if (g_hbc.phase == HybridBarcodeState::COARSE)
 	{
-		// 도착 판정(±1cnt 안정화) -> StopAxis 대신 ProfileStop -> COARSE_BRAKE
+		// 도착 판정(±1cnt 안정화 + 속도도 충분히 느릴 때) -> FINE 전환
 		if (bcErrAbs <= g_hbc.coarseArriveCnt)
 		{
-			if (++g_hbc.coarseStableTicks >= g_hbc.coarseStableTicksNeed)
-			{
-				// ✅ StopAxis(ax) 대신 프로파일 감속 정지
-				HBC_ProfileStop(ax, g_hbc.coarseBrakeVelPps, g_hbc.coarseBrakeAccMs, g_hbc.coarseBrakeDecMs);
+			// 속도까지 같이 보고 안정화 (너무 빨리 FINE 들어가서 튀는 거 방지)
+			if (vCurPps <= g_hbc.coarseToFineVelThreshPps) {
+				if (++g_hbc.coarseStableTicks >= g_hbc.coarseStableTicksNeed)
+				{
+					g_hbc.phase = HybridBarcodeState::FINE;
+					g_hbc.arriveStableTicks = 0;
 
-				g_hbc.stopCooldownUntil = GetTickCount64() + 120;
-				g_hbc.fineStartCooldownUntil = g_hbc.stopCooldownUntil;
+					long long finalErr = g_hbc.targetBarcodeAbs - (long long)now6063;
+					g_hbc.lastErrSign = HBC_signll(finalErr);
+					g_hbc.signFlipTicks = 0;
 
+					// 전환 직후 명령 충돌 방지
+					g_hbc.fineStartCooldownUntil = GetTickCount64() + 120;
+
+					// 커맨드 갱신 유도
+					g_hbc.lastCmdVel = 0;
+					g_hbc.lastCmdTarget = 0;
+
+					g_hbc.coarseStableTicks = 0;
+					return;
+				}
+			}
+			else {
+				// 속도가 아직 높으면 stable 카운트 리셋(느려질 때까지 기다림)
 				g_hbc.coarseStableTicks = 0;
-				g_hbc.phase = HybridBarcodeState::COARSE_BRAKE;
-				return;
 			}
 			return;
 		}
@@ -4438,19 +4420,53 @@ void HBC_Poll(HWND hWnd)
 
 		double vEnvMain = std::min(g_hbc.mainVel, HBC_VelLimitFromDist(distForPlan, aMainDec));
 
-		// COARSE도 너무 가까우면 천천히
-		if (bcErrAbs <= (g_hbc.preStopCnt + 10))
-			vEnvMain = std::min(vEnvMain, std::max(200.0, g_hbc.creepVel));
+		// ===== Smooth ramp near coarse target (ratio^1.5 + aDecEma scale) =====
+		// bcErrAbs가 0으로 갈수록 속도를 부드럽게 낮춰 "프로파일 정지 없이" 스스로 멈추게 유도
+		if (bcErrAbs <= (long long)std::max(1, g_hbc.coarseRampCnt))
+		{
+			double ratio = std::clamp((double)bcErrAbs / (double)std::max(1, g_hbc.coarseRampCnt), 0.0, 1.0);
 
-		if (vEnvMain < 50.0 && distAbs > 0) vEnvMain = 50.0;
+			// 더 부드러움: ratio^1.5
+			double smooth = std::pow(ratio, 1.5);
+
+			const double vMin = 40.0;
+			const double vMax = std::max(200.0, g_hbc.creepVel);
+
+			double vRamp = vMin + (vMax - vMin) * smooth;
+
+			// aDecEma 기반 자동 스케일 (감속이 "잘 될수록" 덜 보수, 안되면 더 보수)
+			if (g_hbc.aDecEma > 0.0) {
+				const double aRef = 18000.0; // 튜닝 포인트
+				double scale = std::clamp(g_hbc.aDecEma / aRef, 0.5, 1.0);
+				vRamp *= scale;
+			}
+
+			vEnvMain = std::min(vEnvMain, vRamp);
+		}
+		else if (bcErrAbs <= (g_hbc.preStopCnt + 10))
+		{
+			// 기존 close-in 제한 완만 유지
+			vEnvMain = std::min(vEnvMain, std::max(200.0, g_hbc.creepVel));
+		}
+
+		if (vEnvMain < 30.0 && distAbs > 0) vEnvMain = 30.0;
+
+		// ===== jerk 제한 (S-curve 느낌) : tick당 dv 제한 =====
+		{
+			double dvMax = std::max(1.0, g_hbc.maxJerkPps2) * dtSec;
+			double dv = vEnvMain - g_hbc.lastCmdVel;
+			if (std::fabs(dv) > dvMax) {
+				vEnvMain = g_hbc.lastCmdVel + std::copysign(dvMax, dv);
+			}
+		}
 
 		long long curPos = g_status.axesStatus[ax].actualPos;
 		long long absTarget = curPos + remainingPulses;
 
 		DWORD period = (bcErrAbs <= 80) ? 40 : 90;
-		double ratio = (bcErrAbs <= 80) ? 0.05 : 0.12;
+		double ratioChg = (bcErrAbs <= 80) ? 0.05 : 0.12;
 
-		HBC_SendMoveThrottled(ax, absTarget, vEnvMain, g_hbc.mainAcc, g_hbc.mainDec, ratio,
+		HBC_SendMoveThrottled(ax, absTarget, vEnvMain, g_hbc.mainAcc, g_hbc.mainDec, ratioChg,
 			/*minTargetDeltaPulses*/ pulsesPerCnt, period);
 
 		return;
@@ -4471,7 +4487,7 @@ void HBC_Poll(HWND hWnd)
 				g_hbc.running = false;
 				g_hbc.phase = HybridBarcodeState::DONE;
 				g_hbc.stopCooldownUntil = GetTickCount64() + 300;
-				StopAxis(ax); // final에서는 이미 저속이라 충격 작음(원하면 ProfileStop으로 바꿔도 됨)
+				StopAxis(ax);
 				return;
 			}
 			return;
@@ -4801,6 +4817,7 @@ void ShowBarcodeDemoWindow(HWND parent)
 		SetForegroundWindow(g_hBarcodeWnd);
 	}
 }
+
 
 
 
