@@ -76,6 +76,12 @@ enum class TaskId : int {
     DemoLoad,
     DemoUnload,
 
+    GoOne,
+	GoTwo,
+	GoThree,
+	GoFour,
+	GoFive,
+
     COUNT
 };
 enum class TaskState : int { Idle = 0, Running, Done, Failed, Stopped };
@@ -98,9 +104,15 @@ const TCHAR* TaskName(TaskId id) {
     case TaskId::All_Demo:      return TEXT("All_Demo");
     case TaskId::DemoLoad:      return TEXT("DemoLoad");
     case TaskId::DemoUnload:    return TEXT("DemoUnload");
+    case TaskId::GoOne:       return TEXT("GoOne");
+    case TaskId::GoTwo:       return TEXT("GoTwo");
+    case TaskId::GoThree:       return TEXT("GoThree");
+    case TaskId::GoFour:       return TEXT("GoFour");
+    case TaskId::GoFive:       return TEXT("GoFive");
     default: return TEXT("Unknown");
     }
 }
+
 const TCHAR* TaskStateStr(TaskState s) {
     switch (s) {
     case TaskState::Idle:    return TEXT("대기");
@@ -2234,20 +2246,6 @@ void GoRight() {
     p.gear = 4.4248; p.wheelDia = 115.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 1.07;
     g_bcRunner.Start(p, TaskId::GoRight);
 }
-
-static void RunTempTask(TaskId id, int ms = 400)
-{
-    if (!g_commStarted) { SetTaskState(id, TaskState::Failed); return; }
-    if (g_taskStatus[(int)id].state.load() == TaskState::Running) return;
-
-    SetTaskState(id, TaskState::Running);
-    std::thread([id, ms]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        // TODO: 실제 모션/IO 연동으로 교체
-        SetTaskState(id, TaskState::Done);
-        }).detach();
-}
-
 void Forward();
 void Backward();
 void Forking() {
@@ -2304,6 +2302,271 @@ void Up() {
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
+
+struct PosFlags {
+    bool IsUp = false;
+    bool IsDown = false;
+
+    bool isCenter = false;
+    bool isLeft = false;
+    bool isRight = false;
+    bool isLeftForward = false;
+    bool isRightForward = false;
+};
+
+static inline PosFlags ReadPosFlags()
+{
+    PosFlags f{};
+
+    bool ax2_up = ReadInputBitRaw(AX2_UPLIMIT_ADDR, AX2_UPLIMIT_BIT, AX2_UPLIMIT_ACTIVE_HIGH);
+    bool ax2_dn = ReadInputBitRaw(AX2_DOWNLIMIT_ADDR, AX2_DOWNLIMIT_BIT, AX2_DOWNLIMIT_ACTIVE_HIGH);
+    bool ax3_up = ReadInputBitRaw(AX3_UPLIMIT_ADDR, AX3_UPLIMIT_BIT, AX3_UPLIMIT_ACTIVE_HIGH);
+    bool ax3_dn = ReadInputBitRaw(AX3_DOWNLIMIT_ADDR, AX3_DOWNLIMIT_BIT, AX3_DOWNLIMIT_ACTIVE_HIGH);
+
+    bool l1 = ReadInputBitRaw(AX5_LIMIT1_ADDR, AX5_LIMIT1_BIT, AX5_LIMIT1_ACTIVE_HIGH);
+    bool l2 = ReadInputBitRaw(AX5_LIMIT2_ADDR, AX5_LIMIT2_BIT, AX5_LIMIT2_ACTIVE_HIGH);
+    bool l3 = ReadInputBitRaw(AX5_LIMIT3_ADDR, AX5_LIMIT3_BIT, AX5_LIMIT3_ACTIVE_HIGH);
+    bool l4 = ReadInputBitRaw(AX5_LIMIT4_ADDR, AX5_LIMIT4_BIT, AX5_LIMIT4_ACTIVE_HIGH);
+
+    f.IsUp = (ax2_up && ax3_up);
+    f.IsDown = (ax2_dn && ax3_dn);
+
+    // ✅ 너가 확정한 조건(바코드 판정 함수는 () 붙임)
+    f.isCenter = (!l1 && !l2 && !l3 && !l4) && IsAxisWorkstation();
+    f.isLeft = (!l1 && l2 && l3 && l4) && IsAxisLeft();
+    f.isRight = (l1 && !l2 && l3 && l4) && IsAxisRight();
+    f.isLeftForward = (l1 && l2 && !l3 && l4);
+    f.isRightForward = (l1 && l2 && l3 && !l4);
+
+    return f;
+}
+
+void GoOne()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::GoOne, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::GoOne].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::GoOne, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+
+        PosFlags f = ReadPosFlags();
+
+        if (f.isCenter) {
+            if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+            if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
+        }
+        else if (f.isLeft) {
+            if (f.IsDown) {
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else if (f.IsUp) {
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else ok = false;
+        }
+        else if (f.isRight) {
+            if (f.IsUp) {
+                if (ok) { GoLeft();  ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { GoLeft();  ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else ok = false;
+        }
+        else if (f.isLeftForward) {
+            // 이미 목표위치: do nothing
+        }
+        else if (f.isRightForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+            if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+            if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
+        }
+        else ok = false;
+
+        SetTaskState(TaskId::GoOne, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+void GoTwo()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::GoTwo, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::GoTwo].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::GoTwo, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+        PosFlags f = ReadPosFlags();
+
+        if (f.isCenter) {
+            if (ok) { GoLeft(); ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+        }
+        else if (f.isLeft) {
+            // do nothing
+        }
+        else if (f.isRight) {
+            if (f.IsUp) {
+                if (ok) { GoLeft(); ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Up();     ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { GoLeft(); ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+            }
+            else ok = false;
+        }
+        else if (f.isLeftForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+        }
+        else if (f.isRightForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+            if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
+        }
+        else ok = false;
+
+        SetTaskState(TaskId::GoTwo, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+void GoThree()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::GoThree, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::GoThree].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::GoThree, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+        PosFlags f = ReadPosFlags();
+
+        if (f.isCenter) {
+            // do nothing
+        }
+        else if (f.isLeft || f.isRight) {
+            if (f.IsUp) {
+                if (ok) { GoWorkstation(); ok = WaitTaskFinished(TaskId::GoWorkstation, 30000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Up();            ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { GoWorkstation(); ok = WaitTaskFinished(TaskId::GoWorkstation, 30000); }
+            }
+            else ok = false;
+        }
+        else if (f.isLeftForward || f.isRightForward) {
+            if (ok) { Backward();      ok = WaitTaskFinished(TaskId::Backward, 60000); }
+            if (ok) { Up();            ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { GoWorkstation(); ok = WaitTaskFinished(TaskId::GoWorkstation, 30000); }
+        }
+        else ok = false;
+
+        SetTaskState(TaskId::GoThree, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+void GoFour()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::GoFour, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::GoFour].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::GoFour, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+        PosFlags f = ReadPosFlags();
+
+        if (f.isCenter) {
+            if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+        }
+        else if (f.isLeft) {
+            if (f.IsUp) {
+                if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+            }
+            else ok = false;
+        }
+        else if (f.isRight) {
+            // do nothing
+        }
+        else if (f.isLeftForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+            if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { GoRight();  ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+        }
+        else if (f.isRightForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+        }
+        else ok = false;
+
+        SetTaskState(TaskId::GoFour, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+void GoFive()
+{
+    if (!g_commStarted) { SetTaskState(TaskId::GoFive, TaskState::Failed); return; }
+    if (g_taskStatus[(int)TaskId::GoFive].state.load() == TaskState::Running) return;
+
+    SetTaskState(TaskId::GoFive, TaskState::Running);
+
+    std::thread([]() {
+        bool ok = true;
+        PosFlags f = ReadPosFlags();
+
+        if (f.isCenter) {
+            if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+            if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+        }
+        else if (f.isLeft) {
+            if (f.IsUp) {
+                if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else ok = false;
+        }
+        else if (f.isRight) {
+            if (f.IsUp) {
+                if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else if (f.IsDown) {
+                if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
+            }
+            else ok = false;
+        }
+        else if (f.isLeftForward) {
+            if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
+            if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { GoRight();  ok = WaitTaskFinished(TaskId::GoRight, 30000); }
+            if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
+        }
+        else if (f.isRightForward) {
+            // do nothing
+        }
+        else ok = false;
+
+        SetTaskState(TaskId::GoFive, ok ? TaskState::Done : TaskState::Failed);
+        }).detach();
+}
+
 
 // Load 시퀀스: Conveyor → Workstation
 void StartDemoLoad()
@@ -2785,7 +3048,7 @@ static void SyncAx5PrevLimitsToCurrent()
 // Travel settings for AX5 "search move" (state machine will decel/stop by limits)
 static const long long AX5_FORWARD_TRAVEL_PULSE = 8000000;  // + direction long move
 static const long long AX5_BACKWARD_TRAVEL_PULSE = 8000000; // - direction long move
-static const double    AX5_CRUISE_VEL_PPS = 5000.0;
+static const double    AX5_CRUISE_VEL_PPS = 4500.0;
 static const double    AX5_CRUISE_ACC_MS = 1000.0;
 static const double    AX5_CRUISE_DEC_MS = 200.0;
 
@@ -3058,12 +3321,8 @@ static void AxLimitSensorTimerProc(HWND)
     }
 
 
-    // ---------------- AX5: special behavior (updated per latest spec) ----------------
-    // Side identification at start/rest:
-    //   Left  : L2,L3,L4 ON  (and L1 OFF)
-    //   Right : L1,L3,L4 ON  (and L2 OFF)
-    //   Center: L1,L2,L3,L4 ON
-    bool isCenter = (l1 && l2 && l3 && l4);
+    // ---------------- AX5: special behavior ----------------
+    bool isCenter = (!l1 && !l2 && !l3 && !l4);
     bool isLeft = (!l1 && l2 && l3 && l4);
     bool isRight = (l1 && !l2 && l3 && l4);
     bool isLeftForward = (l1 && l2 && !l3 && l4);
@@ -3079,29 +3338,37 @@ static void AxLimitSensorTimerProc(HWND)
     Ax5Dir dir = GetAxisDirFromStatus(5);
 
     // Reset one-shot flags when direction changes
+    // ✅ 중요: StopIssued는 Done 확정 전까지 리셋하면 안 됨 (Running이 계속 남는 원인)
     if (dir != g_ax5Dir) {
         g_ax5Dir = dir;
         g_ax5DecelIssued = false;
-        g_ax5StopIssued = false;
+
+        // StopIssued는 유지 (Done 확정용)
+        // g_ax5StopIssued = false;   // ❌ 삭제
+
         g_ax5FromCenter = isCenter;
 
-        // ===== 전용 플래그 리셋 (핵심) =====
-        g_ax5Fwd_L4SawOff = false;
-        g_ax5Fwd_L1SawOff = false;
-        g_ax5Fwd_L3SawOff = false;
-        g_ax5Fwd_L2SawOff = false;
+        // 아래 플래그는 "새로운 이동 시작" 때만 리셋되는 게 이상적이지만,
+        // 기존 동작 유지 위해 dir 바뀔 때도 초기화하되 StopIssued 중이면 최소만 건드린다.
+        if (!g_ax5StopIssued) {
+            // ===== 전용 플래그 리셋 (핵심) =====
+            g_ax5Fwd_L4SawOff = false;
+            g_ax5Fwd_L1SawOff = false;
+            g_ax5Fwd_L3SawOff = false;
+            g_ax5Fwd_L2SawOff = false;
 
-        g_ax5Bwd_L3SawOff = false;   // Left(시작 123)에서: L3 ON→OFF를 봤는지 (감속용)
-        g_ax5Bwd_L4SawOff = false;   // Right(시작 124)에서: L4 ON→OFF를 봤는지 (감속용)
-        g_ax5Bwd_L4SawOff2 = false;  // Left에서: L4가 OFF로 떨어진 적이 있는지 (정지 조건용)
-        g_ax5Bwd_L3SawOff2 = false;  // Right에서: L3가 OFF로 떨어진 적이 있는지 (정지 조건용)
+            g_ax5Bwd_L3SawOff = false;
+            g_ax5Bwd_L4SawOff = false;
+            g_ax5Bwd_L4SawOff2 = false;
+            g_ax5Bwd_L3SawOff2 = false;
+        }
     }
 
     // Update side when idle (start/settled)
     if (dir == Ax5Dir::None) {
         if (isCenter) {
             g_ax5Side = Ax5Side::Center;
-            g_ax5ExpectedSide = Ax5Side::Unknown; // clear expectation when settled
+            g_ax5ExpectedSide = Ax5Side::Unknown;
         }
         else if (isLeft) {
             g_ax5Side = Ax5Side::LeftBackward;
@@ -3131,117 +3398,138 @@ static void AxLimitSensorTimerProc(HWND)
         }
 
         // ---------------- PLUS (+) ----------------
-        if (dir == Ax5Dir::Plus && !g_ax5StopIssued) {
+        if (dir == Ax5Dir::Plus) {
 
             // PLUS Left: from LeftBackward
             if (g_ax5Side == Ax5Side::LeftBackward) {
 
-                // ✅ 감속 패턴: 1x 2o 3x 4o  => (!l1 && l2 && !l3 && l4)
                 bool decelPat = (!l1 && l2 && !l3 && l4);
-
-                // ✅ 정지 패턴: 1o 2o 3x 4o  => ( l1 && l2 && !l3 && l4)
                 bool stopPat = (l1 && l2 && !l3 && l4);
 
-                if (!g_ax5DecelIssued && decelPat) {
-                    Ax5IssueDecel(+1);
-                    g_ax5DecelIssued = true;
-                }
+                if (!g_ax5StopIssued) {
 
-                if (!g_ax5StopIssued && stopPat) {
-                    StopAxis(5);
-                    WriteOutputBit(38, 2, false, true); //전진 led off
-                    g_ax5StopIssued = true;
+                    if (!g_ax5DecelIssued && decelPat) {
+                        Ax5IssueDecel(+1);
+                        g_ax5DecelIssued = true;
+                    }
 
-                    g_ax5LastCheckName = L"PLUS_L_STOP";
-                    g_ax5LastCheckOk = true;
-                    g_ax5Side = Ax5Side::LeftForward; // 정지 패턴이 LeftForward라 즉시 반영
-                    g_ax5UiExtra = L"Plus STOP (Left): 1o2o3x4o";
+                    if (stopPat) {
+                        StopAxis(5);
+                        WriteOutputBit(38, 2, false, true); // 전진 led off
+                        g_ax5StopIssued = true;
 
+                        g_ax5LastCheckName = L"PLUS_L_STOP";
+                        g_ax5LastCheckOk = true;
+                        g_ax5Side = Ax5Side::LeftForward;
+                        g_ax5UiExtra = L"Plus STOP (Left): 1o2o3x4o";
+                    }
                 }
             }
 
             // PLUS Right: from RightBackward
             else if (g_ax5Side == Ax5Side::RightBackward) {
 
-                // ✅ 감속 패턴: 1o 2x 3o 4x  => (l1 && !l2 && l3 && !l4)
                 bool decelPat = (l1 && !l2 && l3 && !l4);
-
-                // ✅ 정지 패턴: 1o 2o 3o 4x  => (l1 &&  l2 &&  l3 && !l4)
                 bool stopPat = (l1 && l2 && l3 && !l4);
 
-                if (!g_ax5DecelIssued && decelPat) {
-                    Ax5IssueDecel(+1);
-                    g_ax5DecelIssued = true;
-                }
+                if (!g_ax5StopIssued) {
 
-                if (!g_ax5StopIssued && stopPat) {
-                    StopAxis(5);
-                    WriteOutputBit(38, 2, false, true); //전진 led off
-                    g_ax5StopIssued = true;
+                    if (!g_ax5DecelIssued && decelPat) {
+                        Ax5IssueDecel(+1);
+                        g_ax5DecelIssued = true;
+                    }
 
-                    g_ax5LastCheckName = L"PLUS_R_STOP";
-                    g_ax5LastCheckOk = true;
-                    g_ax5Side = Ax5Side::RightForward; // 정지 패턴이 RightForward라 즉시 반영
-                    g_ax5UiExtra = L"Plus STOP (Right): 1o2o3o4x";
+                    if (stopPat) {
+                        StopAxis(5);
+                        WriteOutputBit(38, 2, false, true); // 전진 led off
+                        g_ax5StopIssued = true;
 
+                        g_ax5LastCheckName = L"PLUS_R_STOP";
+                        g_ax5LastCheckOk = true;
+                        g_ax5Side = Ax5Side::RightForward;
+                        g_ax5UiExtra = L"Plus STOP (Right): 1o2o3o4x";
+                    }
                 }
             }
         }
 
         // ---------------- MINUS (-) ----------------
-        if (dir == Ax5Dir::Minus && !g_ax5StopIssued) {
+        if (dir == Ax5Dir::Minus) {
 
             // MINUS Left: from LeftForward
             if (g_ax5Side == Ax5Side::LeftForward) {
 
-                // ✅ 감속 패턴: 1x 2o 3o 4x  => (!l1 && l2 && l3 && !l4)
                 bool decelPat = (!l1 && l2 && l3 && !l4);
-
-                // ✅ 정지 패턴: 1x 2o 3o 4o  => (!l1 && l2 && l3 &&  l4)
                 bool stopPat = (!l1 && l2 && l3 && l4);
 
-                if (!g_ax5DecelIssued && decelPat) {
-                    Ax5IssueDecel(-1);
-                    g_ax5DecelIssued = true;
-                }
+                if (!g_ax5StopIssued) {
 
-                if (!g_ax5StopIssued && stopPat) {
-                    StopAxis(5);
-                    WriteOutputBit(38, 1, false, true); //후진 led off
-                    g_ax5StopIssued = true;
+                    if (!g_ax5DecelIssued && decelPat) {
+                        Ax5IssueDecel(-1);
+                        g_ax5DecelIssued = true;
+                    }
 
-                    g_ax5LastCheckName = L"MINUS_L_STOP";
-                    g_ax5LastCheckOk = true;
-                    g_ax5Side = Ax5Side::LeftBackward; // 정지 패턴이 LeftBackward(isLeft)라 즉시 반영
-                    g_ax5UiExtra = L"Minus STOP (Left): 1x2o3o4o";
+                    if (stopPat) {
+                        StopAxis(5);
+                        WriteOutputBit(38, 1, false, true); // 후진 led off
+                        g_ax5StopIssued = true;
+
+                        g_ax5LastCheckName = L"MINUS_L_STOP";
+                        g_ax5LastCheckOk = true;
+                        g_ax5Side = Ax5Side::LeftBackward;
+                        g_ax5UiExtra = L"Minus STOP (Left): 1x2o3o4o";
+                    }
                 }
             }
 
             // MINUS Right: from RightForward
             else if (g_ax5Side == Ax5Side::RightForward) {
 
-                // ✅ 감속 패턴: 1o 2x 3x 4o  => (l1 && !l2 && !l3 && l4)
                 bool decelPat = (l1 && !l2 && !l3 && l4);
-
-                // ✅ 정지 패턴: 1o 2x 3o 4o  => (l1 && !l2 &&  l3 &&  l4)
                 bool stopPat = (l1 && !l2 && l3 && l4);
 
-                if (!g_ax5DecelIssued && decelPat) {
-                    Ax5IssueDecel(-1);
-                    g_ax5DecelIssued = true;
-                }
+                if (!g_ax5StopIssued) {
 
-                if (!g_ax5StopIssued && stopPat) {
-                    StopAxis(5);
-                    WriteOutputBit(38, 1, false, true); //후진 led off
-                    g_ax5StopIssued = true;
+                    if (!g_ax5DecelIssued && decelPat) {
+                        Ax5IssueDecel(-1);
+                        g_ax5DecelIssued = true;
+                    }
 
-                    g_ax5LastCheckName = L"MINUS_R_STOP";
-                    g_ax5LastCheckOk = true;
-                    g_ax5Side = Ax5Side::RightBackward; // 정지 패턴이 RightBackward(isRight)라 즉시 반영
-                    g_ax5UiExtra = L"Minus STOP (Right): 1o2x3o4o";
+                    if (stopPat) {
+                        StopAxis(5);
+                        WriteOutputBit(38, 1, false, true); // 후진 led off
+                        g_ax5StopIssued = true;
+
+                        g_ax5LastCheckName = L"MINUS_R_STOP";
+                        g_ax5LastCheckOk = true;
+                        g_ax5Side = Ax5Side::RightBackward;
+                        g_ax5UiExtra = L"Minus STOP (Right): 1o2x3o4o";
+                    }
                 }
             }
+        }
+    }
+
+    // ✅ 핵심: StopAxis 이후 Done 확정은 dir/패턴과 무관하게 여기서 처리해야 한다.
+    if (g_ax5StopIssued) {
+        CoreMotionStatus st{};
+        g_cm.GetStatus(&st);
+
+        if (std::fabs(st.axesStatus[5].actualVelocity) <= 1.0) {
+
+            // Forward()/Backward()가 이미 세팅한 g_ax5ActiveTask를 사용
+            TaskId t = g_ax5ActiveTask;
+
+            if (t == TaskId::Forward || t == TaskId::Backward) {
+                TaskState ts = GetTaskState(t);
+                if (ts == TaskState::Running || ts == TaskState::Stopped) {
+                    SetTaskState(t, TaskState::Done);
+                }
+            }
+
+            // 다음 동작 대비 정리
+            g_ax5StopIssued = false;
+            g_ax5ActiveTask = TaskId::COUNT;
         }
     }
 
@@ -3300,6 +3588,13 @@ enum : int {
     ID_BTN_ALL_DEMO,
     ID_BTN_DEMO_LOAD,
     ID_BTN_DEMO_UNLOAD,
+
+    // Demo extra buttons
+    ID_BTN_GO1,
+    ID_BTN_GO2,
+    ID_BTN_GO3,
+    ID_BTN_GO4,
+    ID_BTN_GO5,
 
     ID_BTN_STOP_ALL
 };
@@ -3526,7 +3821,7 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
 
     // 6) Demo
     {
-        int grpH = 110;
+        int grpH = 220;
         auto [bx, by] = addGroup(TEXT("Demo"), grpH);
 
         int btnW = (w - padX * 2 - 20) / 3;
@@ -3537,9 +3832,24 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
         CreateWindow(TEXT("BUTTON"), TEXT("DemoUnload"), WS_CHILD | WS_VISIBLE,
             bx + (btnW + 10) * 2, by, btnW, btnH, h, (HMENU)ID_BTN_DEMO_UNLOAD, 0, 0);
 
+        // 추가: Go1~Go5
+        int row2Y = by + btnH + 10;
+        int row3Y = by + (btnH + 10) * 2;
+        CreateWindow(TEXT("BUTTON"), TEXT("Go1"), WS_CHILD | WS_VISIBLE,
+            bx, row2Y, btnW, btnH, h, (HMENU)ID_BTN_GO1, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Go2"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, row2Y, btnW, btnH, h, (HMENU)ID_BTN_GO2, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Go3"), WS_CHILD | WS_VISIBLE,
+            bx + (btnW + 10) * 2, row2Y, btnW, btnH, h, (HMENU)ID_BTN_GO3, 0, 0);
+
+        CreateWindow(TEXT("BUTTON"), TEXT("Go4"), WS_CHILD | WS_VISIBLE,
+            bx, row3Y, btnW, btnH, h, (HMENU)ID_BTN_GO4, 0, 0);
+        CreateWindow(TEXT("BUTTON"), TEXT("Go5"), WS_CHILD | WS_VISIBLE,
+            bx + btnW + 10, row3Y, btnW, btnH, h, (HMENU)ID_BTN_GO5, 0, 0);
+
         // STOP ALL 버튼을 Demo 그룹 아래에 크게 하나 배치
         CreateWindow(TEXT("BUTTON"), TEXT("STOP ALL"), WS_CHILD | WS_VISIBLE,
-            bx, by + btnH + 12, w - padX * 2, 36, h, (HMENU)ID_BTN_STOP_ALL, 0, 0);
+            bx, by + (btnH + 10) * 3 + 8, w - padX * 2, 36, h, (HMENU)ID_BTN_STOP_ALL, 0, 0);
 
         yCursor += grpH + gapY;
     }
@@ -3564,6 +3874,7 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
             ID_BTN_FORKING, ID_BTN_UNFORKING, ID_BTN_OPEN, ID_BTN_CLOSE,
             ID_BTN_HOIST_UP, ID_BTN_HOIST_DOWN,
             ID_BTN_ALL_DEMO, ID_BTN_DEMO_LOAD, ID_BTN_DEMO_UNLOAD,
+            ID_BTN_GO1, ID_BTN_GO2, ID_BTN_GO3, ID_BTN_GO4, ID_BTN_GO5,
             ID_BTN_STOP_ALL
     })
     {
@@ -3698,6 +4009,12 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         case ID_BTN_ALL_DEMO:        StartAllDemo();     return 0;
         case ID_BTN_DEMO_LOAD:       StartDemoLoad();    return 0;
         case ID_BTN_DEMO_UNLOAD:     StartDemoUnload();  return 0;
+
+        case ID_BTN_GO1:             GoOne();            return 0;
+        case ID_BTN_GO2:             GoTwo();            return 0;
+        case ID_BTN_GO3:             GoThree();          return 0;
+        case ID_BTN_GO4:             GoFour();           return 0;
+        case ID_BTN_GO5:             GoFive();           return 0;
 
         case ID_BTN_STOP_ALL:        DoStopAll(hWnd);    return 0;
         default: break;
