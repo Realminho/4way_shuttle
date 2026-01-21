@@ -780,7 +780,7 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
         while (true) {
             // ★★★ 1) 전역 Stop(DoStopAll 등) 감지: task가 Running이 아니면 즉시 종료
             TaskState cur = g_taskStatus[(int)task].state.load(std::memory_order_relaxed);
-            if (cur == TaskState::Stopped || cur == TaskState::Failed) {
+            if ((cur == TaskState::Stopped || cur == TaskState::Failed) && phase != FinalApproach) {
                 result = cur;   // 보통 Stopped
                 break;
             }
@@ -847,7 +847,7 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
                     phase = SoftDecel;
                 }
             }
-            else if (phase == SoftDecel) {
+            else if (phase == SoftDecel && softTargetSet) {
                 // 급감속 소타겟(softTarget)으로 가는 중
                 // 속도가 충분히 줄고, softTarget 근처에 오면 → 최종 타겟으로 저속 접근 시작
                 double eSoft = 0.0;
@@ -859,7 +859,7 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
                 //  - 소타겟 근처(eSoft <= posEps * 2 정도)
                 if (softTargetSet &&
                     actVel <= (ap.vpps + 50.0) &&     // 속도 기준 (적당히 여유)
-                    eSoft <= (posEps * 2.0))
+                    eSoft <= (posEps * 3.0))
                 {
                     // === 2단계: 이제 저속(1000)으로 최종 target까지 이동 ===
                     Motion::PosCommand pc2{};
@@ -877,14 +877,9 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
             else if (phase == FinalApproach) {
                 // 최종 저속 접근 단계: 평소처럼 Done/Stopped 판정
                 if (actVel < velEps) {
-                    if (remErr <= posEps) {
-                        result = TaskState::Done;
-                    }
-                    else {
-                        result = TaskState::Stopped;
-                    }
+                    result = TaskState::Done;
                     break;
-                }
+                }                    
             }
 
             ::Sleep(10);
@@ -2031,7 +2026,7 @@ void Open() {
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Open);
 
     // Move (OPEN은 타겟 도달이 아니라 AX0 리밋센서로 Stop될 때 완료)
-    StartAbsMoveWithProfile(0, -20, 30000, 100, 100);
+    StartAbsMoveWithProfile(0, -20, 40000, 100, 100);
 
     // 완료 판정은 AxLimitSensorTimerProc()의 AX0 limit stop 로직에서 수행
 }
@@ -2045,7 +2040,7 @@ void Close() {
 
     // Move
     const long long tgt = 50600;
-    StartAbsMoveWithProfile(0, tgt, 30000, 100, 100);
+    StartAbsMoveWithProfile(0, tgt, 40000, 100, 100);
 
     // 완료 감시
     StartAxis0MoveDoneMonitor(TaskId::Close, tgt);
@@ -2068,7 +2063,7 @@ void HoistDown() {
     int ax = 4;
     long long tgt = 68000;
     StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        20000.0, 1000.0, 1500.0,
+        40000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });
 }
@@ -2081,7 +2076,7 @@ void HoistUp() {
     int ax = 4;
     long long tgt = 0;
     StartMoveWithApproach(ax, tgt, TaskId::HoistUp,
-        20000.0, 1000.0, 1500.0,
+        40000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });
 }
@@ -2150,7 +2145,7 @@ void Forking() {
     int ax = 1;
     long long tgt = 65000;
     StartMoveWithApproach(ax, tgt, TaskId::Forking,
-        20000.0, 1000.0, 1000.0,
+        60000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
         2000, { 1000.0, 80.0, 10.0 });
 }
@@ -2161,11 +2156,11 @@ void Unforking() {
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Unforking); // ✅ 동일 LED
 
     int ax = 1;
-    long long tgt = -20; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
+    long long tgt = -100; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
     StartMoveWithApproach(ax, tgt, TaskId::Unforking,
-        20000.0, 1000.0, 1000.0,
+        60000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
-        2000, { 1000.0, 80.0, 10.0 });
+        3000, { 1000.0, 80.0, 10.0 });
 }
 
 // Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
@@ -2178,7 +2173,7 @@ void Down() {
     int ax = 2;
     long long tgt = -80000;
     StartMoveWithApproach(ax, tgt, TaskId::Down,
-        20000.0, 100.0, 100.0,
+        30000.0, 500.0, 500.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2191,7 +2186,7 @@ void Up() {
     int ax = 2;
     long long tgt = 80000;
     StartMoveWithApproach(ax, tgt, TaskId::Up,
-        20000.0, 100.0, 100.0,
+        30000.0, 500.0, 500.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2685,7 +2680,7 @@ static bool  g_ax0HomeIssued = false;
 static bool g_ax1StopHomeIssued = false;
 static bool g_ax1HomePending = false;
 static DWORD g_ax1HomeRequestTick = 0;
-static const DWORD AX1_HOME_DELAY_MS = 3000; // Stop 후 Home까지 딜레이
+static const DWORD AX1_HOME_DELAY_MS = 1500; // Stop 후 Home까지 딜레이
 
 
 // ---------- AX2/AX3 (just stop) ----------
