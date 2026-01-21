@@ -1839,43 +1839,7 @@ bool IsAxis4Conveyordown()
     return (std::llabs(perr) <= (long long)posEps) && (v <= velEps);
 }
 
-// 그리퍼가 Open 상태인지 확인 (DO8 레벨 사용)
-bool IsGripperOpen()
-{
-    // DO 레벨은 기존 ReadDO16Bits() 유틸을 재사용
-    uint32_t dir = 0, lvl = 0;
-    if (!ReadDO16Bits(dir, lvl))
-        return false;
 
-    if (g_gpioBank < 0)
-        return false;
-
-    const uint32_t bitOpen = (1u << 8); // Pin 8 = Open
-    // 해당 핀을 실제로 출력으로 지원하는지 확인
-    if ((g_gpioInfo[g_gpioBank].supOutput & bitOpen) == 0)
-        return false;
-
-    // DoOpen_Compat()가 DO8을 ON 시키므로, ON이면 Open 상태로 간주
-    bool isOn = (lvl & bitOpen) != 0;
-    return isOn;
-}
-
-bool IsGripperClosed()
-{
-    uint32_t dir = 0, lvl = 0;
-    if (!ReadDO16Bits(dir, lvl))
-        return false;
-
-    if (g_gpioBank < 0)
-        return false;
-
-    const uint32_t bitClose = (1u << 9); // Pin 9 = Close
-    if ((g_gpioInfo[g_gpioBank].supOutput & bitClose) == 0)
-        return false;
-
-    bool isOn = (lvl & bitClose) != 0;
-    return isOn;
-}
 // Motioning 출력(DO11)의 현재 상태 읽기
 static bool IsMotioningOutputOn()
 {
@@ -1887,30 +1851,6 @@ static bool IsMotioningOutputOn()
     bool on = (lvl & bitMotion) != 0;
     return on;
 }
-
-
-bool IsGripperOpenAndIdle()
-{
-    // 1) 실제 DO8 상태 기준으로 그리퍼가 Open인지 확인
-    if (!IsGripperOpen())
-        return false;
-
-    // 2) GripOpen Task가 Done 상태인지 확인
-    TaskState openState = g_taskStatus[(int)TaskId::Open].state.load();
-    return (openState == TaskState::Done);
-}
-
-bool IsGripperClosedAndIdle()
-{
-    // 1) 실제 DO9 상태 기준으로 그리퍼가 Close인지 확인
-    if (!IsGripperClosed())
-        return false;
-
-    // 2) GripClose Task가 Done 상태인지 확인
-    TaskState closeState = g_taskStatus[(int)TaskId::Close].state.load();
-    return (closeState == TaskState::Done);
-}
-
 
 // 예: DI1을 "박스 감지" 센서로 쓴다고 가정 (input2가 DI1인 경우)
 bool HasBox()
@@ -2004,59 +1944,12 @@ bool WaitTaskFinished(TaskId id, DWORD timeoutMs, DWORD pollMs = 20)
         ::Sleep(pollMs);
     }
 }
-
-
-// Load 시퀀스 시작 전 조건 모두 만족하는지 확인
-static bool CheckDemoLoadPreconditions()
-{
-    //if (!IsAxis0AtConveyorBarcode()) {
-    //    // LOG("DemoLoad NG: Axis0 not at Conveyor barcode");
-    //    return false;
-    //}
-
-    if (!IsAxis4Up()) {
-        // LOG("DemoLoad NG: Axis2 not Up");
-        return false;
-    }
-
-    if (!IsGripperOpen()) {
-        // LOG("DemoLoad NG: Gripper not Open");
-        return false;
-    }
-
-    if (HasBox()) {
-        // LOG("DemoLoad NG: Already has box (Catched ON)");
-        return false;
-    }
-
-    return true;
-}
-
 // Unload 시퀀스 시작 전 조건:
 //  - 축0 : Conveyor 위치
 //  - 축2 : Up 상태
 //  - Gripper : Close
 //  - 박스 있음 (Catched ON)
-static bool CheckDemoUnloadPreconditions()
-{
-    //// 1) 축0이 Conveyor 바코드 위치인가?
-    //if (!IsAxis0AtConveyorBarcode())
-    //    return false;
 
-    // 2) 축2가 Up 위치인가?
-    if (!IsAxis4Up())
-        return false;
-
-    // 3) Gripper가 Close 상태인가?
-    if (!IsGripperClosed())
-        return false;
-
-    // 4) 박스를 실제로 들고 있는가? (Catched == ON)
-    if (!HasBox())
-        return false;
-
-    return true;
-}
 void LedStartBlinkForTask(HWND hWnd, TaskId tid);
 void LedCancel(HWND hWnd);
 void DoGripServoOff_Compat(HWND hWnd) {};
@@ -2138,7 +2031,7 @@ void Open() {
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Open);
 
     // Move (OPEN은 타겟 도달이 아니라 AX0 리밋센서로 Stop될 때 완료)
-    StartAbsMoveWithProfile(0, -20, 20000, 100, 100);
+    StartAbsMoveWithProfile(0, -20, 30000, 100, 100);
 
     // 완료 판정은 AxLimitSensorTimerProc()의 AX0 limit stop 로직에서 수행
 }
@@ -2152,7 +2045,7 @@ void Close() {
 
     // Move
     const long long tgt = 50600;
-    StartAbsMoveWithProfile(0, tgt, 20000, 100, 100);
+    StartAbsMoveWithProfile(0, tgt, 30000, 100, 100);
 
     // 완료 감시
     StartAxis0MoveDoneMonitor(TaskId::Close, tgt);
@@ -2175,7 +2068,7 @@ void HoistDown() {
     int ax = 4;
     long long tgt = 68000;
     StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
-        10000.0, 1000.0, 1500.0,
+        20000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });
 }
@@ -2188,7 +2081,7 @@ void HoistUp() {
     int ax = 4;
     long long tgt = 0;
     StartMoveWithApproach(ax, tgt, TaskId::HoistUp,
-        10000.0, 1000.0, 1500.0,
+        20000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });
 }
@@ -2285,7 +2178,7 @@ void Down() {
     int ax = 2;
     long long tgt = -80000;
     StartMoveWithApproach(ax, tgt, TaskId::Down,
-        10000.0, 100.0, 100.0,
+        20000.0, 100.0, 100.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2298,7 +2191,7 @@ void Up() {
     int ax = 2;
     long long tgt = 80000;
     StartMoveWithApproach(ax, tgt, TaskId::Up,
-        10000.0, 100.0, 100.0,
+        20000.0, 100.0, 100.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2356,6 +2249,7 @@ void GoOne()
         if (f.isCenter) {
             if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
             if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
         }
         else if (f.isLeft) {
@@ -2364,6 +2258,7 @@ void GoOne()
             }
             else if (f.IsUp) {
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else ok = false;
@@ -2372,12 +2267,15 @@ void GoOne()
             if (f.IsUp) {
                 if (ok) { GoLeft();  ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else if (f.IsDown) {
                 if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { GoLeft();  ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else ok = false;
@@ -2388,8 +2286,10 @@ void GoOne()
         else if (f.isRightForward) {
             if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
             if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
             if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
         }
         else ok = false;
@@ -2420,6 +2320,7 @@ void GoTwo()
             }
             else if (f.IsDown) {
                 if (ok) { Up();     ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { GoLeft(); ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
             }
             else ok = false;
@@ -2430,6 +2331,7 @@ void GoTwo()
         else if (f.isRightForward) {
             if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
             if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { GoLeft();   ok = WaitTaskFinished(TaskId::GoLeft, 30000); }
         }
         else ok = false;
@@ -2457,6 +2359,7 @@ void GoThree()
             }
             else if (f.IsDown) {
                 if (ok) { Up();            ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { GoWorkstation(); ok = WaitTaskFinished(TaskId::GoWorkstation, 30000); }
             }
             else ok = false;
@@ -2464,6 +2367,7 @@ void GoThree()
         else if (f.isLeftForward || f.isRightForward) {
             if (ok) { Backward();      ok = WaitTaskFinished(TaskId::Backward, 60000); }
             if (ok) { Up();            ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { GoWorkstation(); ok = WaitTaskFinished(TaskId::GoWorkstation, 30000); }
         }
         else ok = false;
@@ -2491,6 +2395,7 @@ void GoFour()
             }
             else if (f.IsDown) {
                 if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
             }
             else ok = false;
@@ -2501,6 +2406,7 @@ void GoFour()
         else if (f.isLeftForward) {
             if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
             if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { GoRight();  ok = WaitTaskFinished(TaskId::GoRight, 30000); }
         }
         else if (f.isRightForward) {
@@ -2525,18 +2431,22 @@ void GoFive()
         if (f.isCenter) {
             if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
             if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
         }
         else if (f.isLeft) {
             if (f.IsUp) {
                 if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else if (f.IsDown) {
                 if (ok) { Up();      ok = WaitTaskFinished(TaskId::Up, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { GoRight(); ok = WaitTaskFinished(TaskId::GoRight, 30000); }
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else ok = false;
@@ -2544,6 +2454,7 @@ void GoFive()
         else if (f.isRight) {
             if (f.IsUp) {
                 if (ok) { Down();    ok = WaitTaskFinished(TaskId::Down, 30000); }
+                if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
                 if (ok) { Forward(); (void)WaitTaskFinished(TaskId::Forward, 60000); }
             }
             else if (f.IsDown) {
@@ -2554,8 +2465,10 @@ void GoFive()
         else if (f.isLeftForward) {
             if (ok) { Backward(); ok = WaitTaskFinished(TaskId::Backward, 60000); }
             if (ok) { Up();       ok = WaitTaskFinished(TaskId::Up, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { GoRight();  ok = WaitTaskFinished(TaskId::GoRight, 30000); }
             if (ok) { Down();     ok = WaitTaskFinished(TaskId::Down, 30000); }
+            if (ok) { Sleep(500); }   // ✅ Down 끝난 뒤 0.5초 딜레이
             if (ok) { Forward();  (void)WaitTaskFinished(TaskId::Forward, 60000); }
         }
         else if (f.isRightForward) {
@@ -2568,105 +2481,78 @@ void GoFive()
 }
 
 
-// Load 시퀀스: Conveyor → Workstation
+// Load 시퀀스: (요청 변경) GoThree → Forking → Close → Unforking → GoFive
 void StartDemoLoad()
 {
     if (!g_commStarted) { SetTaskState(TaskId::DemoLoad, TaskState::Failed); return; }
     if (g_taskStatus[(int)TaskId::DemoLoad].state.load() == TaskState::Running) return;
 
-    // ★ 시퀀스 시작 전 상태 체크:
-    //  - 축0 바코드가 Conveyor 위치인지
-    //  - 축2가 Up 위치인지
-    //  - 그리퍼가 Open 상태인지
-    if (!CheckDemoLoadPreconditions()) {
-        // 일단 Load 시퀀스 자체는 실패로 표시
-        SetTaskState(TaskId::DemoLoad, TaskState::Failed);
-
-        // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
-        if (!IsAxis2LimitOn()) {
-            HoistUp();
-            (void)WaitUntil(IsAxis4Up, 20000);
-        }
-
-        // 2) 그리퍼 상태 확인
-        unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
-
-        if (gcode == 0x00) {
-
-            // 2-1) 먼저 Close 쪽으로 정리
-            //DoClose_Compat(g_hDemoWnd);
-            (void)WaitUntil(IsGripperClosedAndIdle, 5000);
-
-            // 2-2) Close 상태에서 Servo OFF
-            DoGripServoOff_Compat(g_hDemoWnd);
-
-            // 2-3) 박스 보유 여부 체크
-            if (HasBox()) {
-                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
-            }
-            else {
-
-                // 박스가 없다면 Open 상태로 정리
-                //DoOpen_Compat(g_hDemoWnd);
-                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
-
-                DoGripServoOff_Compat(g_hDemoWnd);
-            }
-        }
-        else {
-            // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
-
-        }
-
-        // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
-        return;
-    }
-
     SetTaskState(TaskId::DemoLoad, TaskState::Running);
+
     std::thread([]() {
         bool ok = true;
-        unsigned char code = CalcPosTravelCode();
-        // 1. Conveyor 위치로 이동 (필요할 때만)
+
+        // 0) GoThree (Workstation 위치로 이동)
         if (ok) {
-            if (code == 0x01) {
-            }
-            else {
-                GoLeft();
-                if (!WaitUntil(IsAxisLeftStopped, 30000)) {
-                    ok = false;
-                }
-                Sleep(1000);
-            }
+            GoThree();
+            ok = WaitTaskFinished(TaskId::GoThree, 60000);   // 시간은 필요 시 조정
         }
 
-        // 1. ConveyorDown (박스 높이로 하강)
+        Sleep(500);
+
+        // 1) Forking
         if (ok) {
-            HoistDown();
-            // 축2가 ConveyorDown 위치에 도달할 때까지 대기
-            if (!WaitUntil(IsAxis4Conveyordown, 20000))
-                ok = false;
+            Forking();                                      // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Forking, 30000);   // ✅ TaskId 존재/시간 조정
         }
 
-        // 2. 그리퍼 Close (박스 잡기)
+        Sleep(300);
+
+        // 2) Close (박스 잡기)
         if (ok) {
-            //DoClose_Compat(g_hDemoWnd);
-            // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
-            if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
-                ok = false;
+            Close();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
+            ok = WaitTaskFinished(TaskId::Close, 60000);
+
+            // TaskId::Close를 별도로 관리한다면 아래를 사용
+            // ok = WaitTaskFinished(TaskId::Close, 10000);
         }
 
-        // 3. 축2 Up
+        Sleep(300);
+
+        // 3) Unforking
         if (ok) {
-            HoistUp();
-            if (!WaitUntil(IsAxis4Up, 20000))
-                ok = false;
+            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Unforking, 30000);
         }
 
-        Sleep(1000);
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            HoistDown();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::HoistDown, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            HoistUp();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::HoistUp, 30000);
+        }
+
+        Sleep(500);
+
+        // 4) GoFive
+        if (ok) {
+            GoFive();
+            ok = WaitTaskFinished(TaskId::GoFive, 90000);    // GoRight+Down+Forward 포함이라 넉넉히
+        }
 
         SetTaskState(TaskId::DemoLoad, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
 }
+
 
 // Unload 시퀀스: Workstation → Conveyor
 void StartDemoUnload()
@@ -2674,98 +2560,67 @@ void StartDemoUnload()
     if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); return; }
     if (g_taskStatus[(int)TaskId::DemoUnload].state.load() == TaskState::Running) return;
 
-    if (!CheckDemoUnloadPreconditions()) {
-        // 일단 Load 시퀀스 자체는 실패로 표시
-        SetTaskState(TaskId::DemoUnload, TaskState::Failed);
-
-        // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
-        if (!IsAxis2LimitOn()) {
-            HoistUp();
-            (void)WaitUntil(IsAxis4Up, 20000);
-        }
-
-        // 2) 그리퍼 상태 확인
-        unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
-
-        if (gcode == 0x00) {
-
-            // 2-1) 먼저 Close 쪽으로 정리
-            //DoClose_Compat(g_hDemoWnd);
-            (void)WaitUntil(IsGripperClosedAndIdle, 5000);
-
-            // 2-2) Close 상태에서 Servo OFF
-            DoGripServoOff_Compat(g_hDemoWnd);
-
-            // 2-3) 박스 보유 여부 체크
-            if (HasBox()) {
-                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
-            }
-            else {
-
-                // 박스가 없다면 Open 상태로 정리
-                //DoOpen_Compat(g_hDemoWnd);
-                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
-
-                DoGripServoOff_Compat(g_hDemoWnd);
-            }
-        }
-        else {
-            // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
-
-        }
-
-        // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
-        return;
-    }
-
     SetTaskState(TaskId::DemoUnload, TaskState::Running);
+
     std::thread([]() {
         bool ok = true;
-        unsigned char code = CalcPosTravelCode();
 
-        // 1. Workstation 위치로 이동 (필요할 때만)
+        // 0) GoThree (Workstation 위치로 이동)
         if (ok) {
-            if (code == 0x02) {
-                // 이미 Workstation 바코드 위치 → 이동 스킵
-            }
-            else {
-                GoWorkstation();
-                if (!WaitUntil(IsAxisWorkstationStopped, 30000))
-                    ok = false;
-            }
-            Sleep(1000);
+            GoThree();
+            ok = WaitTaskFinished(TaskId::GoThree, 60000);   // 시간은 필요 시 조정
         }
 
+        Sleep(500);
 
-        // 2. WorkDown (작업 위치로 하강)
+        // 1) Forking
         if (ok) {
-            HoistDown();
-            if (!WaitUntil(IsAxis4Workdown, 20000))
-                ok = false;
+            Forking();                                      // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Forking, 30000);   // ✅ TaskId 존재/시간 조정
         }
 
-        // 3. 그리퍼 Open (박스 내려놓기)
+        Sleep(300);
+
+        // 2) Close (박스 잡기)
         if (ok) {
-            //DoOpen_Compat(g_hDemoWnd);
-            // Unload 목적: "박스 내려놓고 더 이상 들고 있지 않음" → NoBox() 기준
-            if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-                ok = false;
+            Open();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
+            ok = WaitTaskFinished(TaskId::Open, 60000);
+
+            // TaskId::Close를 별도로 관리한다면 아래를 사용
+            // ok = WaitTaskFinished(TaskId::Close, 10000);
         }
 
-        // 4. 축2 Up
+        Sleep(300);
+
+        // 3) Unforking
         if (ok) {
-            HoistUp();
-            if (!WaitUntil(IsAxis4Up, 20000))
-                ok = false;
+            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Unforking, 30000);
         }
 
-        // 5. Conveyor 위치로 이동
+        Sleep(500);
+
+        // 3) Unforking
         if (ok) {
-            GoLeft();
-            if (!WaitUntil(IsAxisLeftStopped, 30000))
-                ok = false;
+            HoistDown();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::HoistDown, 30000);
         }
-        Sleep(1000);
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            HoistUp();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::HoistUp, 30000);
+        }
+
+        Sleep(500);
+
+        // 4) GoFive
+        if (ok) {
+            GoFive();
+            ok = WaitTaskFinished(TaskId::GoFive, 90000);    // GoRight+Down+Forward 포함이라 넉넉히
+        }
 
         SetTaskState(TaskId::DemoUnload, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
@@ -3113,6 +2968,8 @@ void Forward()
     // 이전 센서 상태를 현재로 동기화 (필수: 첫 tick에서 Rise/Fall 튀는 것 방지)
     SyncAx5PrevLimitsToCurrent();
 
+    Sleep(1000);
+
     // + 방향 장거리 이동 시작 (기존 함수 그대로 사용)
     StartAx5LongMove(+1);
 }
@@ -3161,6 +3018,8 @@ void Backward()
 
     // Prev 동기화 (첫 tick 에지 튐 방지)
     SyncAx5PrevLimitsToCurrent();
+
+    Sleep(1000);
 
     // - 방향 이동 시작
     StartAx5LongMove(-1);
@@ -3599,26 +3458,66 @@ enum : int {
     ID_BTN_STOP_ALL
 };
 
-static void CreateStatusArea(HWND h, int x, int y, int w, int hgt) {
+static void CreateStatusArea(HWND h, int x, int y, int w, int hgt)
+{
     HWND grp = CreateWindow(TEXT("BUTTON"), TEXT("Status"),
         WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
         x, y, w, hgt, h, 0, 0, 0);
 
-    int innerX = x + 10;
-    int innerY = y + 25;
-    int lineH = 22;
-    int colW = w - 20;
-    for (int i = 0; i < (int)TaskId::COUNT; ++i) {
-        HWND s = CreateWindow(TEXT("STATIC"),
-            TaskName((TaskId)i),
-            WS_CHILD | WS_VISIBLE,
-            innerX, innerY + i * (lineH + 6), colW, lineH, h, 0, 0, 0);
-        g_hStatusStatics[i] = s;
-        std::wstring text = std::wstring(TaskName((TaskId)i)) + L": " + TaskStateStr(g_taskStatus[i].state.load());
-        SetWindowTextW(s, text.c_str());
+    const int padL = 6, padR = 6;
+    const int topPad = 22;
+    const int bottomPad = 8;
+
+    const int lineH = 22;
+    const int gapY = 4;
+
+    const int cols = 3;       // ✅ 무조건 3열
+    const int gapX = 10;      // ✅ 열 간격(원하는 만큼 조절)
+
+    const int innerX = x + padL;
+    const int innerY = y + topPad;
+    const int innerW = w - padL - padR;
+
+    int availableH = hgt - topPad - bottomPad;
+    int maxRowsPerCol = std::max(1, availableH / (lineH + gapY));
+
+    // 3열 너비 계산 (간격 포함)
+    int totalGapW = gapX * (cols - 1);
+    int colW = (innerW - totalGapW) / cols;
+    if (colW < 40) colW = 40; // 너무 좁아지는 경우 최소폭
+
+    const int total = (int)TaskId::COUNT;
+
+    // 문자열 준비
+    std::vector<std::wstring> lines(total);
+    for (int i = 0; i < total; ++i) {
+        lines[i] = std::wstring(TaskName((TaskId)i)) + L": " +
+            TaskStateStr(g_taskStatus[i].state.load());
     }
+
+    for (int i = 0; i < total; ++i) {
+        int col = i / maxRowsPerCol;   // 0,1,2...
+        int row = i % maxRowsPerCol;
+
+        // 3열 공간을 넘으면 표시 안 함(원하면 여기서 "...more" 처리 가능)
+        if (col >= cols) continue;
+
+        int xx = innerX + col * (colW + gapX);
+        int yy = innerY + row * (lineH + gapY);
+
+        HWND s = CreateWindow(TEXT("STATIC"),
+            TEXT(""),
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            xx, yy, colW, lineH,
+            h, 0, 0, 0);
+
+        g_hStatusStatics[i] = s;
+        SetWindowTextW(s, lines[i].c_str());
+    }
+
     (void)grp;
 }
+
 
 static void CreateLeftGPIOUI(HWND h, HINSTANCE hInst, int x, int y, int w, int hgt)
 {

@@ -34,10 +34,6 @@ bool IsAxis0AtWorkstationBarcode();
 bool IsAxis4Up();
 bool IsAxis4Workdown();
 bool IsAxis4Conveyordown();
-bool IsGripperOpen();
-bool IsGripperOpenAndIdle();
-bool IsGripperClosed();
-bool IsGripperClosedAndIdle();
 bool HasBox();
 bool NoBox();
 

@@ -67,10 +67,6 @@ extern bool EnumerateGPIO();
 extern bool PickBank_DI0_7_DO8_15();
 extern bool EnsureDO8to15AsOutput_BankFirst();
 extern void RefreshLevels(HWND hWnd);
-extern bool IsGripperOpen();
-extern bool IsGripperOpenAndIdle();
-extern bool IsGripperClosed();
-extern bool IsGripperClosedAndIdle();
 extern bool g_diStable[8]; // DI0(Motioning), DI1(Catched) 등 디바운스 결과 사용
 extern void GoLeft();     // Conveyor 버튼이 눌렸을 때 실행되는 함수
 extern void GoWorkstation();  // Workstation 버튼이 눌렸을 때 실행되는 함수
@@ -80,10 +76,6 @@ extern void Up();            // Up 버튼
 //extern void DoClose_Compat(HWND hWnd); // Close 버튼
 //extern void DoOpen_Compat(HWND hWnd); // Open 버튼
 extern void DoStopAll(HWND hWnd); // Stop All 버튼
-extern bool IsGripperOpen(); // 그립퍼 열림 상태 외부 참조
-extern bool IsGripperOpenAndIdle(); // 그립퍼 열림 상태 외부 참조
-extern bool IsGripperClosed(); // 그립퍼 닫힘 상태 외부 참조
-extern bool IsGripperClosedAndIdle(); // 그립퍼 닫힘 상태 외부 참조
 extern bool g_distable[8]; // 그립퍼 축 비활성화 플래그 외부 참조
 
 // 보조 대기 함수들 (질문 본문과 동일) ? WaitUntil, WaitTaskFinished, WaitAllAxesStopped 등
@@ -102,18 +94,6 @@ extern struct ApproachProfile {
 };
 
 extern void StartMoveWithApproach(int axis, long long target, TaskId task, double mainVpps, double mainAccMs, double mainDecMs, double posEps, double velEps, DWORD timeoutMs, double approachEps, const ApproachProfile& ap);
-
-// ============ 상태 조회 헬퍼(예시) ============
-static bool IsGripperAlreadyOpen()
-{
-	// IsGripperOpenAndIdle가 충분하면 그것으로 대체 가능
-	return IsGripperOpenAndIdle();
-}
-
-static bool IsGripperAlreadyClosed()
-{
-	return IsGripperClosedAndIdle();
-}
 
 // ===================== 사용자 설정 =====================
 static TCHAR g_installPath[] = TEXT("C:\\Program Files\\SoftServo\\WMX3");
@@ -1514,29 +1494,29 @@ static unsigned char CalcPosHoistCode()
 
 unsigned char CalcPosGripCode()
 {
-	// 진행중이면 0x00
-	if (g_gripBusy.load()) return 0x00;
+	//// 진행중이면 0x00
+	//if (g_gripBusy.load()) return 0x00;
 
-	// Motioning 입력(DI0)을 참조: ON이면 동작중이므로 0x00
-	// g_diStable[0] == true 면 Motioning ON으로 사용하고 있으므로, true => 동작중
-	if (g_diStable[0]) return 0x00;
+	//// Motioning 입력(DI0)을 참조: ON이면 동작중이므로 0x00
+	//// g_diStable[0] == true 면 Motioning ON으로 사용하고 있으므로, true => 동작중
+	//if (g_diStable[0]) return 0x00;
 
-	// DemoControl 쪽 Gripper 판단 로직 재사용
-	bool isOpen = IsGripperOpenAndIdle();
-	bool isClose = IsGripperClosedAndIdle();
-	bool openinit = IsGripperOpen();
-	bool closeinit = IsGripperClosed();
-	bool hasbox = HasBox();
+	//// DemoControl 쪽 Gripper 판단 로직 재사용
+	//bool isOpen = IsGripperOpenAndIdle();
+	//bool isClose = IsGripperClosedAndIdle();
+	//bool openinit = IsGripperOpen();
+	//bool closeinit = IsGripperClosed();
+	//bool hasbox = HasBox();
 
-	// Open만 ON
-	if (isOpen && !isClose || openinit)
-		return 0x01;
+	//// Open만 ON
+	//if (isOpen && !isClose || openinit)
+	//	return 0x01;
 
-	// Close만 ON
-	if (!isOpen && isClose || closeinit || hasbox)
-		return 0x02;
+	//// Close만 ON
+	//if (!isOpen && isClose || closeinit || hasbox)
+	//	return 0x02;
 
-	// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
+	//// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
 	return 0x00;
 }
 
@@ -2258,11 +2238,11 @@ void TcpServerThreadProc()
 							AppendLog(L"[INTERLOCK] Grip Open blocked: HasBox()==true");
 							break;
 						}
-						if (IsGripperAlreadyOpen()) {
+						/*if (IsGripperAlreadyOpen()) {
 							AppendLog(L"[SKIP] Grip already OPEN. No action performed.");
 							okGrip = true;
 							break;
-						}
+						}*/
 
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
@@ -2270,7 +2250,7 @@ void TcpServerThreadProc()
 
 						ToggleDO_HW(11, motioning, nullptr);
 						//DoOpen_Compat(nullptr);
-						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
+						//okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
 
 						g_gripBusy = false;
@@ -2280,11 +2260,11 @@ void TcpServerThreadProc()
 						break;
 
 					case 2: // Close
-						if (IsGripperAlreadyClosed()) {
+						/*if (IsGripperAlreadyClosed()) {
 							AppendLog(L"[SKIP] Grip already CLOSED. No action performed.");
 							okGrip = false;
 							break;
-						}
+						}*/
 
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
@@ -2292,7 +2272,7 @@ void TcpServerThreadProc()
 
 						ToggleDO_HW(11, motioning, nullptr);
 						//DoClose_Compat(nullptr);
-						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+						//okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
 						g_gripBusy = false;
 
@@ -2348,7 +2328,7 @@ void TcpServerThreadProc()
 						// 2-1) 먼저 Close 쪽으로 정리
 						AppendLog(L"[ACT] DriveReady: Grip ambiguous -> Close then ServoOff");
 						//DoClose_Compat(g_hDemoWnd);
-						(void)WaitUntil(IsGripperClosedAndIdle, 5000);
+						//(void)WaitUntil(IsGripperClosedAndIdle, 5000);
 
 						// 2-2) Close 상태에서 Servo OFF
 						//DoGripServoOff_Compat(g_hDemoWnd);
@@ -2362,7 +2342,7 @@ void TcpServerThreadProc()
 							// 박스가 없다면 Open 상태로 정리
 							AppendLog(L"[ACT] DriveReady: HasBox()==false -> Open then ServoOff");
 							//DoOpen_Compat(g_hDemoWnd);
-							(void)WaitUntil(IsGripperOpenAndIdle, 5000);
+							//(void)WaitUntil(IsGripperOpenAndIdle, 5000);
 							//DoGripServoOff_Compat(g_hDemoWnd);
 						}
 					}
