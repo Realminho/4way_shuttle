@@ -2547,8 +2547,8 @@ void StartDemoLoad()
 
         // 4) GoFive
         if (ok) {
-            GoFive();
-            ok = WaitTaskFinished(TaskId::GoFive, 90000);    // GoRight+Down+Forward 포함이라 넉넉히
+            GoOne();
+            ok = WaitTaskFinished(TaskId::GoOne, 90000);    // GoRight+Down+Forward 포함이라 넉넉히
         }
 
         SetTaskState(TaskId::DemoLoad, ok ? TaskState::Done : TaskState::Failed);
