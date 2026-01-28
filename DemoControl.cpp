@@ -975,7 +975,7 @@ static const bool AX5_LIMIT4_ACTIVE_HIGH = true;
 static const DWORD AX_LIMIT_POLL_MS = 5;
 
 // AX0: if limit stays ON for >= 1s -> home (actpos->0)
-static const DWORD AX0_LIMIT_HOME_HOLD_MS = 1000;
+static const DWORD AX0_LIMIT_HOME_HOLD_MS = 2000;
 
 // AX5: decel profile (tune as needed)
 static const double AX5_DECEL_VEL_PPS = 500.0;
@@ -2025,8 +2025,12 @@ void Open() {
     SetTaskState(TaskId::Open, TaskState::Running);
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Open);
 
+    const long long tgt = -20;
     // Move (OPEN은 타겟 도달이 아니라 AX0 리밋센서로 Stop될 때 완료)
-    StartAbsMoveWithProfile(0, -20, 40000, 100, 100);
+    StartMoveWithApproach(0, tgt, TaskId::Open,
+        40000.0, 100.0, 1000.0,
+        10.0, 2.0, 30000,
+        10000, { 10000.0, 500.0, 500.0 });
 
     // 완료 판정은 AxLimitSensorTimerProc()의 AX0 limit stop 로직에서 수행
 }
@@ -2039,8 +2043,11 @@ void Close() {
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Close);
 
     // Move
-    const long long tgt = 50600;
-    StartAbsMoveWithProfile(0, tgt, 40000, 100, 100);
+    const long long tgt = 48500;
+    StartMoveWithApproach(0, tgt, TaskId::Close,
+        40000.0, 100.0, 1000.0,
+        10.0, 2.0, 30000,
+        10000, { 10000.0, 500.0, 500.0 });
 
     // 완료 감시
     StartAxis0MoveDoneMonitor(TaskId::Close, tgt);
@@ -2145,7 +2152,7 @@ void Forking() {
     int ax = 1;
     long long tgt = 65000;
     StartMoveWithApproach(ax, tgt, TaskId::Forking,
-        60000.0, 1000.0, 1000.0,
+        50000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
         2000, { 1000.0, 80.0, 10.0 });
 }
@@ -2156,11 +2163,11 @@ void Unforking() {
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Unforking); // ✅ 동일 LED
 
     int ax = 1;
-    long long tgt = -100; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
+    long long tgt = -1000; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
     StartMoveWithApproach(ax, tgt, TaskId::Unforking,
-        60000.0, 1000.0, 1000.0,
+        50000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
-        3000, { 1000.0, 80.0, 10.0 });
+        4000, { 1000.0, 80.0, 10.0 });
 }
 
 // Down 버튼(임시): 기존 WorkDown(45000)으로 내려감
@@ -2173,7 +2180,7 @@ void Down() {
     int ax = 2;
     long long tgt = -80000;
     StartMoveWithApproach(ax, tgt, TaskId::Down,
-        30000.0, 500.0, 500.0,
+        20000.0, 500.0, 500.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2186,7 +2193,7 @@ void Up() {
     int ax = 2;
     long long tgt = 80000;
     StartMoveWithApproach(ax, tgt, TaskId::Up,
-        30000.0, 500.0, 500.0,
+        20000.0, 500.0, 500.0,
         10.0, 2.0, 30000,
         1000, { 1000.0, 80.0, 10.0 });
 }
@@ -2632,17 +2639,158 @@ void StartAllDemo()
     std::thread([]() {
         bool ok = true;
 
-        // 1) DemoLoad
-        StartDemoLoad();
-        if (!WaitTaskFinished(TaskId::DemoLoad, 5000))
-            ok = false;
-
-        // 2) DemoUnload
+        // 0) GoThree (Workstation 위치로 이동)
         if (ok) {
-            StartDemoUnload();
-            if (!WaitTaskFinished(TaskId::DemoUnload, 5000))
-                ok = false;
+            Forking();
+            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
         }
+
+        Sleep(500);
+
+        // 1) Forking
+        if (ok) {
+            Close();                                      // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
+        }
+
+        Sleep(300);
+
+        // 2) Close (박스 잡기)
+        if (ok) {
+            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
+            ok = WaitTaskFinished(TaskId::Unforking, 60000);
+
+            // TaskId::Close를 별도로 관리한다면 아래를 사용
+            // ok = WaitTaskFinished(TaskId::Close, 10000);
+        }
+
+        Sleep(300);
+
+        // 3) Unforking
+        if (ok) {
+            Forking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Forking, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Open();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Open, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Unforking, 30000);
+        }
+
+        Sleep(500);
+
+        // 0) GoThree (Workstation 위치로 이동)
+        if (ok) {
+            Forking();
+            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
+        }
+
+        Sleep(500);
+
+        // 1) Forking
+        if (ok) {
+            Close();                                      // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
+        }
+
+        Sleep(300);
+
+        // 2) Close (박스 잡기)
+        if (ok) {
+            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
+            ok = WaitTaskFinished(TaskId::Unforking, 60000);
+
+            // TaskId::Close를 별도로 관리한다면 아래를 사용
+            // ok = WaitTaskFinished(TaskId::Close, 10000);
+        }
+
+        Sleep(300);
+
+        // 3) Unforking
+        if (ok) {
+            Forking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Forking, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Open();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Open, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Unforking, 30000);
+        }
+
+        Sleep(500);
+
+        // 0) GoThree (Workstation 위치로 이동)
+        if (ok) {
+            Forking();
+            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
+        }
+
+        Sleep(500);
+
+        // 1) Forking
+        if (ok) {
+            Close();                                      // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
+        }
+
+        Sleep(300);
+
+        // 2) Close (박스 잡기)
+        if (ok) {
+            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
+            ok = WaitTaskFinished(TaskId::Unforking, 60000);
+
+            // TaskId::Close를 별도로 관리한다면 아래를 사용
+            // ok = WaitTaskFinished(TaskId::Close, 10000);
+        }
+
+        Sleep(300);
+
+        // 3) Unforking
+        if (ok) {
+            Forking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Forking, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Open();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Open, 30000);
+        }
+
+        Sleep(500);
+
+        // 3) Unforking
+        if (ok) {
+            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
+            ok = WaitTaskFinished(TaskId::Unforking, 30000);
+        }
+
+        Sleep(500);
 
         SetTaskState(TaskId::All_Demo, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
