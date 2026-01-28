@@ -170,6 +170,12 @@ void SetTaskState(TaskId id, TaskState st) {
 
     // If this task owns the common action LED, finalize/cancel blink based on state.
     LedOnTaskStateChanged(g_hDemoWnd, id, st);
+
+    if ((id == TaskId::Forking || id == TaskId::Unforking) && st == TaskState::Done) {
+        WriteOutputBit(38, 2, false, true);
+        WriteOutputBit(38, 1, false, true);
+    }
+
 }
 void ResetAllTaskStates() {
     for (int i = 0; i < (int)TaskId::COUNT; ++i)
@@ -2118,7 +2124,7 @@ void GoLeft() {
 
     BarcodeParams p{};
     p.axis = 7;
-    p.targetBarcodeAbs = 140;
+    p.targetBarcodeAbs = 139;
     p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 1;
@@ -2147,6 +2153,7 @@ void Forking() {
     if (!g_commStarted) { SetTaskState(TaskId::Forking, TaskState::Failed); return; }
 
     SetTaskState(TaskId::Forking, TaskState::Running);
+    WriteOutputBit(38, 2, true, true);
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Forking); // ✅ 동일 LED
 
     int ax = 1;
@@ -2160,6 +2167,7 @@ void Unforking() {
     if (!g_commStarted) { SetTaskState(TaskId::Unforking, TaskState::Failed); return; }
 
     SetTaskState(TaskId::Unforking, TaskState::Running);
+    WriteOutputBit(38, 1, true, true);
     LedStartBlinkForTask(g_hDemoWnd, TaskId::Unforking); // ✅ 동일 LED
 
     int ax = 1;
