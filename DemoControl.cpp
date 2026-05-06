@@ -63,6 +63,9 @@ enum class TaskId : int {
     Forking,
     Unforking,
 
+    Forking2,
+    Unforking2,
+
     Open,
     Close,
 
@@ -1711,7 +1714,7 @@ void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
 bool IsAxisLeft()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 140;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 134;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1726,7 +1729,7 @@ bool IsAxisLeft()
 bool IsAxisRight()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 2775;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 2776;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1804,6 +1807,40 @@ bool IsAxis4Up()
     return (std::llabs(perr) <= (long long)posEps) && (v <= velEps);
 }
 
+bool IsAxis5ok()
+{
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+
+    const long long targetPos = 400000;       // DoUp()에서 사용하는 타겟
+    const double posEps = 10.0;          // 위치 허용 오차
+    const double velEps = 1.0;           // 속도 허용 오차
+
+    const auto& ax = st.axesStatus[5];
+
+    long long perr = (long long)ax.actualPos - targetPos;
+    double    v = std::fabs(ax.actualVelocity);
+
+    return (std::llabs(perr) <= (long long)posEps) && (v <= velEps);
+}
+
+bool IsAxis7ok()
+{
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+
+    const long long targetPos = 400000;       // DoUp()에서 사용하는 타겟
+    const double posEps = 10.0;          // 위치 허용 오차
+    const double velEps = 1.0;           // 속도 허용 오차
+
+    const auto& ax = st.axesStatus[7];
+
+    long long perr = (long long)ax.actualPos - targetPos;
+    double    v = std::fabs(ax.actualVelocity);
+
+    return (std::llabs(perr) <= (long long)posEps) && (v <= velEps);
+}
+
 // 축2가 Up 위치(0 근처)인지 확인
 bool IsAxis4Workdown()
 {
@@ -1829,6 +1866,7 @@ bool IsAxis4Conveyordown()
     g_cm.GetStatus(&st);
 
     const long long targetPos = 68000;       // HoistDown() target (요구사항)
+    //const long long targetPos = 40500;       // HoistDown() target (요구사항)
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -2075,6 +2113,7 @@ void HoistDown() {
 
     int ax = 4;
     long long tgt = 68000;
+    //long long tgt = 40500;
     StartMoveWithApproach(ax, tgt, TaskId::HoistDown,
         40000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
@@ -2124,7 +2163,7 @@ void GoLeft() {
 
     BarcodeParams p{};
     p.axis = 7;
-    p.targetBarcodeAbs = 139;
+    p.targetBarcodeAbs = 134;
     p.mainVel = 10000.0; p.mainAcc = 1000.0; p.mainDec = 1000.0;
     p.corrVel = 1000.0; p.corrAcc = 300.0; p.corrDec = 300.0;
     p.deadband = 1;
@@ -2173,6 +2212,34 @@ void Unforking() {
     int ax = 1;
     long long tgt = -1000; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
     StartMoveWithApproach(ax, tgt, TaskId::Unforking,
+        50000.0, 1000.0, 1000.0,
+        10.0, 2.0, 30000,
+        4000, { 1000.0, 80.0, 10.0 });
+}
+void Forking2() {
+    if (!g_commStarted) { SetTaskState(TaskId::Forking2, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Forking2, TaskState::Running);
+    WriteOutputBit(38, 2, true, true);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Forking2); // ✅ 동일 LED
+
+    int ax = 1;
+    long long tgt = -65000;
+    StartMoveWithApproach(ax, tgt, TaskId::Forking2,
+        50000.0, 1000.0, 1000.0,
+        10.0, 2.0, 30000,
+        2000, { 1000.0, 80.0, 10.0 });
+}
+void Unforking2() {
+    if (!g_commStarted) { SetTaskState(TaskId::Unforking2, TaskState::Failed); return; }
+
+    SetTaskState(TaskId::Unforking2, TaskState::Running);
+    WriteOutputBit(38, 1, true, true);
+    LedStartBlinkForTask(g_hDemoWnd, TaskId::Unforking2); // ✅ 동일 LED
+
+    int ax = 1;
+    long long tgt = +1000; // NOTE: Unforking은 타겟 도달이 아니라 AX1 리밋으로 Stop될 때 Done
+    StartMoveWithApproach(ax, tgt, TaskId::Unforking2,
         50000.0, 1000.0, 1000.0,
         10.0, 2.0, 30000,
         4000, { 1000.0, 80.0, 10.0 });
@@ -2637,6 +2704,7 @@ void StartDemoUnload()
 }
 
 // 전체 Demo: (임시 구현) DemoLoad → DemoUnload 순서로 실행
+// 전체 Demo: DemoLoad → DemoUnload 순서로 반복 실행
 void StartAllDemo()
 {
     if (!g_commStarted) { SetTaskState(TaskId::All_Demo, TaskState::Failed); return; }
@@ -2646,159 +2714,31 @@ void StartAllDemo()
 
     std::thread([]() {
         bool ok = true;
+        int repeatCount = 3;  // 반복 횟수 설정 (원하는 횟수로 조정)
 
-        // 0) GoThree (Workstation 위치로 이동)
-        if (ok) {
-            Forking();
-            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
+        for (int i = 0; i < repeatCount && ok; ++i) {
+            // 0) GoThree (Workstation 위치로 이동)
+            if (ok) {
+                StartDemoLoad();
+                // DemoLoad가 완료될 때까지 대기 (TaskState::Done 확인)
+                while (g_taskStatus[(int)TaskId::DemoLoad].state.load() != TaskState::Done) {
+                    Sleep(100);  // 잠시 대기
+                }
+            }
+
+            Sleep(1000);  // 대기 시간
+
+            // 1) Forking (DemoLoad가 완료된 후 실행)
+            if (ok) {
+                StartDemoUnload();  // 프로젝트 함수명에 맞게
+                // DemoUnload가 완료될 때까지 대기 (TaskState::Done 확인)
+                while (g_taskStatus[(int)TaskId::DemoUnload].state.load() != TaskState::Done) {
+                    Sleep(100);  // 잠시 대기
+                }
+            }
+
+            Sleep(1000);  // 대기 시간
         }
-
-        Sleep(500);
-
-        // 1) Forking
-        if (ok) {
-            Close();                                      // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
-        }
-
-        Sleep(300);
-
-        // 2) Close (박스 잡기)
-        if (ok) {
-            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
-            ok = WaitTaskFinished(TaskId::Unforking, 60000);
-
-            // TaskId::Close를 별도로 관리한다면 아래를 사용
-            // ok = WaitTaskFinished(TaskId::Close, 10000);
-        }
-
-        Sleep(300);
-
-        // 3) Unforking
-        if (ok) {
-            Forking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Forking, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Open();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Open, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Unforking, 30000);
-        }
-
-        Sleep(500);
-
-        // 0) GoThree (Workstation 위치로 이동)
-        if (ok) {
-            Forking();
-            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
-        }
-
-        Sleep(500);
-
-        // 1) Forking
-        if (ok) {
-            Close();                                      // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
-        }
-
-        Sleep(300);
-
-        // 2) Close (박스 잡기)
-        if (ok) {
-            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
-            ok = WaitTaskFinished(TaskId::Unforking, 60000);
-
-            // TaskId::Close를 별도로 관리한다면 아래를 사용
-            // ok = WaitTaskFinished(TaskId::Close, 10000);
-        }
-
-        Sleep(300);
-
-        // 3) Unforking
-        if (ok) {
-            Forking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Forking, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Open();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Open, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Unforking, 30000);
-        }
-
-        Sleep(500);
-
-        // 0) GoThree (Workstation 위치로 이동)
-        if (ok) {
-            Forking();
-            ok = WaitTaskFinished(TaskId::Forking, 60000);   // 시간은 필요 시 조정
-        }
-
-        Sleep(500);
-
-        // 1) Forking
-        if (ok) {
-            Close();                                      // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Close, 30000);   // ✅ TaskId 존재/시간 조정
-        }
-
-        Sleep(300);
-
-        // 2) Close (박스 잡기)
-        if (ok) {
-            Unforking();                                        // ✅ DoClose_Compat(...)를 쓰는 구조면 그걸로 교체
-            ok = WaitTaskFinished(TaskId::Unforking, 60000);
-
-            // TaskId::Close를 별도로 관리한다면 아래를 사용
-            // ok = WaitTaskFinished(TaskId::Close, 10000);
-        }
-
-        Sleep(300);
-
-        // 3) Unforking
-        if (ok) {
-            Forking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Forking, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Open();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Open, 30000);
-        }
-
-        Sleep(500);
-
-        // 3) Unforking
-        if (ok) {
-            Unforking();                                    // ✅ 프로젝트 함수명에 맞게
-            ok = WaitTaskFinished(TaskId::Unforking, 30000);
-        }
-
-        Sleep(500);
 
         SetTaskState(TaskId::All_Demo, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
@@ -3015,7 +2955,17 @@ static void BuildAx5StopFlagsUi(bool l1, bool l2, bool l3, bool l4)
         std::wstring(L"Forward left  : ") + OnOff(uiFwdLeftPat) + L"\r\n" +
         std::wstring(L"Forward right : ") + OnOff(uiFwdRightPat) + L"\r\n" +
         std::wstring(L"Backward left : ") + OnOff(uiBwdLeftPat) + L"\r\n" +
-        std::wstring(L"Backward right: ") + OnOff(uiBwdRightPat);
+        std::wstring(L"Backward right: ") + OnOff(uiBwdRightPat) + L"\r\n" + L"\r\n" +
+        std::wstring(L"AX0 : 폭조절") + L"\r\n" +
+        std::wstring(L"AX1 : 포킹암") + L"\r\n" +
+        std::wstring(L"AX2 : 사이드 업다운") + L"\r\n" +
+        std::wstring(L"AX3 : 사이드 업다운") + L"\r\n" +
+        std::wstring(L"AX4 : 호이스트") + L"\r\n" +
+        std::wstring(L"AX5 : 사이드 주행") + L"\r\n" +
+        std::wstring(L"AX6 : 사이드 주행") + L"\r\n" +
+        std::wstring(L"AX7 : 메인 주행") + L"\r\n" +
+        std::wstring(L"AX8 : 메인 주행");
+
 
     // ✅ 실제 Static 컨트롤 텍스트를 즉시 갱신 (핵심)
     if (g_hAx5StopFlagsStatic) {
@@ -3054,7 +3004,7 @@ static void SyncAx5PrevLimitsToCurrent()
 // Travel settings for AX5 "search move" (state machine will decel/stop by limits)
 static const long long AX5_FORWARD_TRAVEL_PULSE = 8000000;  // + direction long move
 static const long long AX5_BACKWARD_TRAVEL_PULSE = 8000000; // - direction long move
-static const double    AX5_CRUISE_VEL_PPS = 4500.0;
+static const double    AX5_CRUISE_VEL_PPS = 4600.0;
 static const double    AX5_CRUISE_ACC_MS = 1000.0;
 static const double    AX5_CRUISE_DEC_MS = 200.0;
 
@@ -3763,7 +3713,7 @@ static void CreateLeftGPIOUI(HWND h, HINSTANCE hInst, int x, int y, int w, int h
             L"STATIC",
             L"Forward left  : OFF\r\nForward right : OFF\r\nBackward left : OFF\r\nBackward right: OFF",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            sx, stopY, w - 48, 80,
+            sx, stopY, w - 48, 280,
             h, nullptr, hInst, nullptr
         );
         if (g_hAx5StopFlagsStatic) {

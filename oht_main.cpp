@@ -1431,6 +1431,74 @@ static bool StartComm() {
 	WriteOutputBit(38, 3, true, true); //Blue led
 	WriteOutputBit(38, 4, true, true); //Pink led
 
+	// Sync Groups
+// Group 0: Master=2, Slave=3
+// Group 1: Master=5, Slave=6
+// Group 2: Master=7, Slave=8
+
+	if (g_commStarted) {
+
+		struct SyncGroupSetup {
+			int groupNo;
+			int masterAxis;
+			int slaveAxis;
+			bool useSyncErrorTolerance;
+		};
+
+		SyncGroupSetup syncGroups[] = {
+			{ 0, 2, 3, false },
+			{ 1, 5, 6, false },
+			{ 2, 7, 8, true  }   // SyncGroup 2만 syncErrorTolerance 적용
+		};
+
+		for (const auto& sg : syncGroups) {
+
+			Sync::SyncGroup grp{};
+			grp.masterAxis = sg.masterAxis;
+			grp.slaveAxisCount = 1;
+			grp.slaveAxis[0] = sg.slaveAxis;
+
+			grp.servoOnOffSynchronization = 1;
+			grp.startupType = Sync::SyncGroupStartupType::Normal;
+			grp.gantryLoopCycleRatio = 1;
+			grp.maxCatchUpDistance = 0.0;
+			grp.catchUpVelocity = 0.0;
+			grp.catchUpAcc = 0.0;
+
+			if (sg.useSyncErrorTolerance) {
+				grp.syncErrorTolerance = 1000.0;
+			}
+
+			grp.useMasterFeedback = 0;
+
+			Sync::SyncGroupStatus gst{};
+			if (g_cm.sync->GetSyncGroupStatus(sg.groupNo, &gst) == ErrorCode::None && gst.enabled) {
+				g_cm.sync->EnableSyncGroup(sg.groupNo, 0);
+				Sleep(10);
+			}
+
+			long se = g_cm.sync->SetSyncGroup(sg.groupNo, grp);
+
+			if (se == ErrorCode::None) {
+				Sleep(10);
+
+				Config::SyncParam sp{};
+				if (g_cm.config->GetSyncParam(grp.masterAxis, &sp) == ErrorCode::None) {
+					sp.masterDesyncDec = 10000.0;
+					sp.slaveDesyncDec = 10000.0;
+
+					g_cm.config->SetSyncParam(grp.masterAxis, &sp, nullptr);
+					Sleep(10);
+				}
+
+				g_cm.sync->EnableSyncGroup(sg.groupNo, 1);
+				Sleep(10);
+			}
+		}
+	}
+
+
+
 	return true;
 }
 
@@ -5802,6 +5870,16 @@ static void CreateUI_MainRebuild(HWND h)
 		CreateWindow(TEXT("BUTTON"), cap, WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
 			xx, chkTop, 85, 26, h, (HMENU)ID_CHECK_AXIS(a), nullptr, nullptr);
 	}
+
+	CreateWindow(TEXT("STATIC"), TEXT("AX0 : 폭조절"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX1 : 포킹암"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 20, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX2 : 사이드 업다운"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 40, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX3 : 사이드 업다운"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 60, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX4 : 호이스트"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 80, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX5 : 사이드 주행"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 100, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX6 : 사이드 주행"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 120, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX7 : 메인 주행"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 140, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
+	CreateWindow(TEXT("STATIC"), TEXT("AX8 : 메인 주행"), WS_CHILD | WS_VISIBLE, cx2 + 400, 50 + 160, 180, 20, h, (HMENU)ID_MULTI_BTN_ALARMRST, 0, 0);
 
 	// ================= 상태 테이블 (작은 글꼴) =================
 	int statusTop = group2Top + 120;
