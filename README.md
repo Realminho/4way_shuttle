@@ -364,20 +364,6 @@ DI 신호의 순간 변화가 장비 상태 판정으로 바로 전달되면 잘
 
 ---
 
-## Demo Media Checklist
-
-포트폴리오 제출 전 아래 자료를 추가하면 프로젝트 전달력이 더 좋아집니다.
-
-- [x] 전체 로봇 주행 영상
-- [ ] Left / Center / Right 이동 영상
-- [ ] Shuttle Forward / Backward 영상
-- [ ] Forking / Unforking 영상
-- [ ] 자동 목적지 시퀀스 영상
-- [ ] 제어 프로그램 UI 캡처
-- [ ] EtherCAT / Servo 장비 사진
-
----
-
 ### Keywords
 
 `Robotics` `Motion Control` `C++` `WMX3` `EtherCAT` `Servo` `Win32` `GPIO` `Automation` `4-Way Shuttle` `Material Handling` `Sequence Control`
